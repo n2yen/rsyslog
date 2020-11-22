@@ -429,6 +429,7 @@ TESTS +=  \
 	rscript_exists-not3.sh \
 	rscript_exists-not4.sh \
 	rscript-config_enable-on.sh \
+	rscript_get_property.sh \
 	config_output-o-option.sh \
 	rs-cnum.sh \
 	rs-substring.sh \
@@ -491,6 +492,7 @@ TESTS +=  \
 	rscript_backticks-vg.sh \
 	rscript_backticks_empty_envvar-vg.sh \
 	rscript-config_enable-off-vg.sh \
+	rscript_get_property-vg.sh \
 	prop-jsonmesg-vg.sh \
 	mmexternal-InvldProg-vg.sh \
 	internal-errmsg-memleak-vg.sh \
@@ -1729,6 +1731,8 @@ EXTRA_DIST= \
 	rscript_exists-not2.sh \
 	rscript_exists-not3.sh \
 	rscript_exists-not4.sh \
+	rscript_get_property.sh \
+	rscript_get_property-vg.sh \
 	rs-cnum.sh \
 	rs-int2hex.sh \
 	rs-substring.sh \
