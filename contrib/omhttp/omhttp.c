@@ -57,6 +57,9 @@
 #include "ruleset.h"
 #include "statsobj.h"
 
+//#include <sys/queue.h>
+#include "omhttp_sender.h"
+
 #ifndef O_LARGEFILE
 #  define O_LARGEFILE 0
 #endif
@@ -149,6 +152,11 @@ typedef struct instanceConf_s {
 	uchar *retryRulesetName;
 	ruleset_t *retryRuleset;
 	struct instanceConf_s *next;
+
+	// sender specific characteristics
+	size_t max_connections;
+	sbool use_send_thread;
+
 } instanceData;
 
 struct modConfData_s {
@@ -182,6 +190,15 @@ typedef struct wrkrInstanceData {
 		size_t curLen;
 		size_t len;
 	} compressCtx;
+#if 1
+	// TODO:
+	// we need an array of batches up to maximum number of batches
+	// writer thread
+	sbool use_sender;
+	sender_t sender_thrd;
+	// end writer thread stuff
+	pthread_mutex_t mut;
+#endif
 } wrkrInstanceData_t;
 
 /* tables for interfacing with the v6 config system */
@@ -245,6 +262,63 @@ growCompressCtx(wrkrInstanceData_t *pWrkrData, size_t newLen);
 static rsRetVal ATTR_NONNULL()
 appendCompressCtx(wrkrInstanceData_t *pWrkrData, uchar *srcBuf, size_t srcLen);
 
+typedef struct omhttp_request_data_s {
+	wrkrInstanceData_t *pWrkrData; // Note access to this must be strictly synchronized
+	omhttp_batch_t batchData;
+	uchar* postData; // we can use this in case we want to manage the memory here. // may not be necessary.
+	size_t postLen; // we can use this in case we want to manage the memory here. // may not be necessary.
+	/* track the reply */
+	int replyLen;
+	char *reply;
+	long statusCode;
+} omhttp_request_data_t;
+
+static rsRetVal
+omhttpSenderCheckResult(omhttp_request_data_t *pRequestData)
+{
+	if (!pRequestData) {
+		return 0;
+	}
+	// Grab the HTTP Response code
+	printf("omhttpSenderCheckResult - status: %d, requestData: %s\n", pRequestData->statusCode, pRequestData->postData);
+	if(pRequestData->reply == NULL) {
+		DBGPRINTF("omhttp: curlPost pRequestData reply==NULL, replyLen = '%d'\n",
+			pRequestData->replyLen);
+		printf("omhttp: curlPost pRequestData reply==NULL, replyLen = '%d'\n",
+			pRequestData->replyLen);
+	} else {
+		DBGPRINTF("omhttp: curlPost pRequestData replyLen = '%d'\n", pRequestData->replyLen);
+		if(pRequestData->replyLen > 0) {
+			pRequestData->reply[pRequestData->replyLen] = '\0';
+			/* Append 0 Byte if replyLen is above 0 - byte has been reserved in malloc */
+		}
+		//TODO: replyLen++? because 0 Byte is appended
+		DBGPRINTF("omhttp: curlPost pRequestData reply: '%s'\n", pRequestData->reply);
+	}
+	return 0;
+}
+
+/* multi-threaded related interfaces */
+static rsRetVal curl_complete(CURL *curl)
+{
+	CURLcode code;
+	long statusCode;
+	//omhttp_request_data_t *pRequestData;
+
+	printf("curl_complete called - curl_h: %p\n", (void*)curl);
+	//code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
+	//printf("curl_easy_getinfo - private data: %d\n", code);
+	//assert(code == CURLE_OK);
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
+	printf("curl_complete - status: %d\n", statusCode);
+
+	//omhttpSenderCheckResult(pRequestData);
+	curl_easy_cleanup(curl);
+
+	// clean up private data
+	//free(pRequestData->postData);
+}
+
 BEGINcreateInstance
 CODESTARTcreateInstance
 	pData->fdErrFile = -1;
@@ -281,8 +355,19 @@ CODESTARTcreateWrkrInstance
 			pWrkrData->batch.restPath = NULL;
 		}
 	}
+	pWrkrData->use_sender = 0;
 	initCompressCtx(pWrkrData);
 	iRet = curlSetup(pWrkrData);
+#if 1
+	pthread_mutex_init(&pWrkrData->mut, NULL);
+	// Let's initialize our sender thread
+	//init_sender(&pWrkrData->sender_thrd, pData->max_connections);
+	init_sender(&pWrkrData->sender_thrd, 10, curl_complete);
+	// start worker
+	start_send_worker(&pWrkrData->sender_thrd);
+	// end
+#endif
+
 ENDcreateWrkrInstance
 
 BEGINisCompatibleWithFeature
@@ -330,6 +415,9 @@ ENDfreeInstance
 BEGINfreeWrkrInstance
 CODESTARTfreeWrkrInstance
 	curlCleanup(pWrkrData);
+
+	stop_send_worker(&pWrkrData->sender_thrd);
+	pthread_mutex_destroy(&pWrkrData->mut);
 
 	free(pWrkrData->restURL);
 	pWrkrData->restURL = NULL;
@@ -631,6 +719,58 @@ setPostURL(wrkrInstanceData_t *const pWrkrData, uchar **const tpls)
 	pWrkrData->restURL = (uchar*)es_str2cstr(url, NULL);
 	curl_easy_setopt(pWrkrData->curlPostHandle, CURLOPT_URL, pWrkrData->restURL);
 	DBGPRINTF("omhttp: using REST URL: '%s'\n", pWrkrData->restURL);
+
+finalize_it:
+	if (url != NULL)
+		es_deleteStr(url);
+	RETiRet;
+}
+
+static rsRetVal ATTR_NONNULL(1)
+setPostURLExternal(const wrkrInstanceData_t *const pWrkrData, uchar **const tpls,
+	CURL *curl, uchar **outRestURL)
+{
+	uchar *restPath;
+	char* baseUrl;
+	es_str_t *url;
+	uchar *restURL = NULL;
+	int r;
+	DEFiRet;
+	instanceData *const pData = pWrkrData->pData;
+
+	baseUrl = (char*)pData->serverBaseUrls[pWrkrData->serverIndex];
+	url = es_newStrFromCStr(baseUrl, strlen(baseUrl));
+	if (url == NULL) {
+		LogError(0, RS_RET_OUT_OF_MEMORY,
+			"omhttp: error allocating new estr for POST url.");
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	if (pWrkrData->batch.restPath != NULL) {
+		/* get from batch if set! */
+		restPath = pWrkrData->batch.restPath;
+	} else {
+		getRestPath(pData, tpls, &restPath);
+	}
+
+	r = 0;
+	if (restPath != NULL)
+		r = es_addBuf(&url, (char*)restPath, ustrlen(restPath));
+
+	if(r != 0) {
+		LogError(0, RS_RET_ERR, "omhttp: failure in creating restURL, "
+				"error code: %d", r);
+		ABORT_FINALIZE(RS_RET_ERR);
+	}
+
+	if(pWrkrData->restURL != NULL)
+		free(pWrkrData->restURL);
+
+	restURL = (uchar*)es_str2cstr(url, NULL);
+	curl_easy_setopt(curl, CURLOPT_URL, restURL);
+	DBGPRINTF("omhttp: using REST URL: '%s'\n", restURL);
+	printf("omhttp: using REST URL: '%s'\n", restURL);
+	*outRestURL = restURL;
 
 finalize_it:
 	if (url != NULL)
@@ -1082,10 +1222,213 @@ finalize_it:
 	RETiRet;
 }
 
+/* Some duplicate code to curlSetup, but we need to add the gzip content-encoding
+ * header at runtime, and if the compression fails, we do not want to send it.
+ * Additionally, the curlCheckConnHandle should not be configured with a gzip header.
+ */
+static rsRetVal ATTR_NONNULL()
+buildCurlHeadersExternal(wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip,
+	HEADER **out_curlHeader)
+{
+	struct curl_slist *slist = NULL;
 
+	DEFiRet;
+
+	if (pWrkrData->pData->httpcontenttype != NULL) {
+		// If content type specified use it, otherwise use a sane default
+		slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerContentTypeBuf);
+	} else {
+		if (pWrkrData->pData->batchMode) {
+			// If in batch mode, use the approprate content type header for the format,
+			// defaulting to text/plain with newline
+			switch (pWrkrData->pData->batchFormat) {
+				case FMT_JSONARRAY:
+					slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
+					break;
+				case FMT_KAFKAREST:
+					slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_KAFKA);
+					break;
+				case FMT_NEWLINE:
+					slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_TEXT);
+					break;
+				case FMT_LOKIREST:
+					slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
+					break;
+				default:
+					slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_TEXT);
+			}
+		} else {
+			// Otherwise non batch, presume most users are sending JSON
+			slist = curl_slist_append(slist, HTTP_HEADER_CONTENT_JSON);
+		}
+	}
+
+	CHKmalloc(slist);
+
+	// Configured headers..
+	if (pWrkrData->pData->headerBuf != NULL) {
+		slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerBuf);
+		CHKmalloc(slist);
+	}
+
+	for (int k = 0 ; k < pWrkrData->pData->nHttpHeaders; k++) {
+		slist = curl_slist_append(slist, (char *)pWrkrData->pData->httpHeaders[k]);
+		CHKmalloc(slist);
+	}
+
+	// When sending more than 1Kb, libcurl automatically sends an Except: 100-Continue header
+	// and will wait 1s for a response, could make this configurable but for now disable
+	slist = curl_slist_append(slist, HTTP_HEADER_EXPECT_EMPTY);
+	CHKmalloc(slist);
+
+	if (contentEncodeGzip) {
+		slist = curl_slist_append(slist, HTTP_HEADER_ENCODING_GZIP);
+		CHKmalloc(slist);
+	}
+
+	if (pWrkrData->curlHeader != NULL)
+		curl_slist_free_all(pWrkrData->curlHeader);
+
+	*out_curlHeader = slist;
+
+finalize_it:
+	if (iRet != RS_RET_OK) {
+		curl_slist_free_all(slist);
+		LogError(0, iRet, "omhttp: error allocating curl header slist, using previous one");
+	}
+	RETiRet;
+}
+
+/**
+ * private data that will be used to share some private data
+ * We'll need to define 2 things here.
+ * 1. An object which we can use to store what is in a batch. This object
+ * 	can later be used to submit any failed batches back into
+ *
+ * 2. we'll need to define a callback function, this is like a request complete
+ * 	callback. I think i've defined it somewhere here.
+ *
+ */
+
+static size_t
+omhttpSenderCurlResult(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	printf("omhttpSenderCurlResult called\n");
+	char *p = (char*)ptr;
+	omhttp_request_data_t *pRequestData = (omhttp_request_data_t*)userdata;
+	char *buf;
+	size_t newlen;
+	newlen = pRequestData->replyLen + size * nmemb;
+	if ((buf = realloc(pRequestData->replyLen, newlen + 1)) == NULL) {
+		LogError(errno, RS_RET_ERR, "omhttp: realloc failed in curlResult");
+		return 0; /* abort due to failure */
+	}
+	memcpy(buf+pRequestData->replyLen, p, size*nmemb);
+	pRequestData->replyLen = newlen;
+	pRequestData->reply = buf;
+	return size*nmemb;
+}
+
+/**
+ * Use the sender thread to post request data.
+ * Pre-condition: A correctly set up `pWrkrData`
+ * Post-condition: WrkrData may be modified with relevant updated data
+ * however, in this case, all of this data will be forwarded to the batch
+ * request queue.
+ *
+ * Should we forward the entire Wrkrinstance? That would mean we would need to lock on
+ * each of the
+ *
+ */
+static rsRetVal ATTR_NONNULL(1, 2)
+curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpls,
+		const int nmsgs __attribute__((unused)))
+{
+	/**
+	 * logic should be:
+	 * 1. check if endpoint is healthy
+	 * 2. then build out the request
+	 * 3. pass any private data
+	 * 4. return
+	 */
+
+	CURL *curl = NULL;
+	char errbuf[CURL_ERROR_SIZE] = "";
+
+	char *postData;
+	int postLen;
+	sbool compressed;
+	uchar *restURL = NULL;
+	DEFiRet;
+
+	CHKmalloc(curl = curl_easy_init());
+	PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
+	if(pWrkrData->pData->numServers > 1) {
+		/* needs to be called to support ES HA feature */
+		CHKiRet(checkConn(pWrkrData));
+	}
+
+	// set post url, but use
+	CHKiRet(setPostURLExternal(pWrkrData, tpls, curl, &restURL));
+
+	pWrkrData->reply = NULL;
+	pWrkrData->replyLen = 0;
+	pWrkrData->httpStatusCode = 0;
+
+	postData = (char*)message;
+	postLen = msglen;
+	compressed = 0;
+
+	if (pWrkrData->pData->compress) {
+		iRet = compressHttpPayload(pWrkrData, message, msglen);
+		if (iRet != RS_RET_OK) {
+			LogError(0, iRet, "omhttp: curlPost error while compressing, will default to uncompressed");
+		} else {
+			postData = (char *)pWrkrData->compressCtx.buf;
+			postLen = pWrkrData->compressCtx.curLen;
+			compressed = 1;
+			DBGPRINTF("omhttp: curlPost compressed %d to %d bytes\n", msglen, postLen);
+		}
+	}
+	buildCurlHeaders(pWrkrData, compressed);
+
+	printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
+	// TODO: optimize this, by freeing this batch data as part of the
+	// completion call.
+	// NOTE: size must be set prior to call to copy postfield
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postLen);
+#if 1
+	curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, postData);
+#else
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData);
+#endif
+	//curl_easy_setopt(curl, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
+	//curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+
+	// set up the private cookie data
+	//omhttp_request_data_t *pRequestData = (omhttp_request_data_t*) calloc(1, sizeof(omhttp_request_data_t));
+	//pRequestData->postData = strdup(postData);
+	//pRequestData->postData = postLen;
+	//curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
+
+	// curl code is now ready, submit this to our request queue.
+	// we can put the rest of this code into a completion function
+	//iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, curl, NULL);
+	iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, curl, pWrkrData);
+
+finalize_it:
+	incrementServerIndex(pWrkrData);
+	//if (pWrkrData->reply != NULL) {
+	//	free(pWrkrData->reply);
+	//	pWrkrData->reply = NULL; /* don't leave dangling pointer */
+	//}
+
+	RETiRet;
+}
+// end use the sender thread
 
 static rsRetVal ATTR_NONNULL(1, 2)
-curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpls,
+_curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpls,
 		const int nmsgs __attribute__((unused)))
 {
 	CURLcode curlCode;
@@ -1173,6 +1516,14 @@ finalize_it:
 		pWrkrData->reply = NULL; /* don't leave dangling pointer */
 	}
 	RETiRet;
+}
+
+static rsRetVal ATTR_NONNULL(1, 2)
+curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpls,
+		const int nmsgs __attribute__((unused)))
+{
+	return curlPostSender(pWrkrData, message, msglen, tpls, nmsgs);
+	//return _curlPost(pWrkrData, message, msglen, tpls, nmsgs);
 }
 
 /* Build a JSON batch that conforms to the Kafka Rest Proxy format.
@@ -1475,7 +1826,8 @@ submitBatch(wrkrInstanceData_t *pWrkrData, uchar **tpls)
 	if (iRet != RS_RET_OK || batchBuf == NULL)
 		ABORT_FINALIZE(iRet);
 
-	DBGPRINTF("omhttp: submitBatch, batch: '%s' tpls: '%p'\n", batchBuf, tpls);
+	//DBGPRINTF("omhttp: submitBatch, batch: '%s' tpls: '%p'\n", batchBuf, tpls);
+	printf("omhttp: submitBatch, batch: '%s' tpls: '%p'\n", batchBuf, tpls);
 
 	CHKiRet(curlPost(pWrkrData, (uchar*) batchBuf, strlen(batchBuf),
 		tpls, pWrkrData->batch.nmemb));
@@ -1504,6 +1856,7 @@ CODESTARTdoAction
 	uchar *restPath = NULL;
 	STATSCOUNTER_INC(ctrMessagesSubmitted, mutCtrMessagesSubmitted);
 
+	pthread_mutex_lock(&pWrkrData->mut);
 	if (pWrkrData->pData->batchMode) {
 		if(pData->dynRestPath) {
 			/* Get copy of restpath in batch mode if dynRestPath enabled */
@@ -1560,6 +1913,7 @@ CODESTARTdoAction
 		CHKiRet(curlPost(pWrkrData, ppString[0], strlen((char*)ppString[0]), ppString, 1));
 	}
 finalize_it:
+	pthread_mutex_unlock(&pWrkrData->mut);
 ENDdoAction
 
 
@@ -1642,8 +1996,16 @@ curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle)
 	PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
 	curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
 	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
-	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
-	curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
+	if (pWrkrData->use_sender) {
+		printf("using omhttpSenderCurlResult\n");
+		// this isn't working, we need to set a writedata option
+		curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, omhttpSenderCurlResult);
+	} else {
+		printf("using curlResult\n");
+		curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
+		curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
+	}
+	//curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
 	if(pWrkrData->pData->allowUnsignedCerts)
 		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
 	if(pWrkrData->pData->skipVerifyHost)
@@ -1658,8 +2020,8 @@ curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle)
 		curl_easy_setopt(handle, CURLOPT_SSLCERT, pWrkrData->pData->myCertFile);
 	if(pWrkrData->pData->myPrivKeyFile)
 		curl_easy_setopt(handle, CURLOPT_SSLKEY, pWrkrData->pData->myPrivKeyFile);
-	/* uncomment for in-dept debuggung:
-	curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE); */
+	// uncomment for in-dept debuggung:
+	curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE);
 }
 
 static void ATTR_NONNULL()
