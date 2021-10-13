@@ -53,41 +53,35 @@ static void destroyIoQ(sender_q_t *sender_q)
 }
 
 rsRetVal
-enqueueSendReq(sender_q_t *sender_q, CURL* curl, const void* private_data)
+enqueueSendReq(sender_q_t *sender_q, omhttp_request_data_t *pRequestData)
 {
 	sender_req_t *req;
 	DEFiRet;
 
 	CHKmalloc(req = malloc(sizeof(sender_req_t)));
-	req->curl_h = curl;
-	req->buffer= NULL;
-	req->private_data = private_data;
+	req->pRequestData = pRequestData;
 	pthread_mutex_lock(&sender_q->mut);
 /*
 	if (dispatchInlineIfQueueFull && io_q.sz > inlineDispatchThreshold) {
 		dispatchInline = 1;
 	} else {
 */
-	printf("enqueue waiting for room... curl: %p\n", (void*)req->curl_h);
+	printf("enqueue waiting for room... pRequestData: %p\n", (void*)req->pRequestData);
 	while(sender_q->size >= sender_q->capacity) {
 		printf("producer(%p) - size: %d, capacity: %d, waiting for room...\n",
 				(void*)pthread_self(), sender_q->size, sender_q->capacity);
+		assert(sender_q->size >= sender_q->capacity);
 		pthread_cond_wait(&sender_q->cond_has_space, &sender_q->mut);
 	}
-#if 0
-	//if (sender_q->size < sender_q->capacity)
-#endif
-	{
-		STAILQ_INSERT_TAIL(&sender_q->head, req, link);
-		sender_q->size++;
-		#if 0
-		STATSCOUNTER_INC(sender_q->ctrEnq, sender_q.mutCtrEnq);
-		STATSCOUNTER_SETMAX_NOMUT(sender_q->ctrMaxSz, sender_q->sz);
-		#endif
 
-		printf("inserted curl request: %p\n", (void*)req->curl_h);
-		//pthread_cond_signal(&sender_q->wakeup_worker);
-	}
+	STAILQ_INSERT_TAIL(&sender_q->head, req, link);
+	sender_q->size++;
+	#if 0
+	STATSCOUNTER_INC(sender_q->ctrEnq, sender_q.mutCtrEnq);
+	STATSCOUNTER_SETMAX_NOMUT(sender_q->ctrMaxSz, sender_q->sz);
+	#endif
+	printf("inserted requestData: %p\n", (void*)req->pRequestData);
+	//pthread_cond_signal(&sender_q->wakeup_worker);
 #if 0
 	else {
 		iRet = RS_RET_SUSPENDED;
@@ -109,7 +103,30 @@ finalize_it:
 	RETiRet;
 }
 
-static sender_req_t* dequeueSendReq(sender_q_t *sender_q)
+#if 0
+static consumeRemainingRequests()
+{
+		if (me->runstate == 1 )
+		{
+			pthread_mutex_lock(&me->sender_q.mut);
+			size_t cur_size = me->sender_q.size;
+			pthread_mutex_unlock(&me->sender_q.mut);
+			printf(">>>> queue is shutting down!!! - items left: %d\n", cur_size);
+			if (cur_size > 0) {
+				// consume the rest
+				for (int i = 0; i < cur_size; ++i) {
+					req = dequeueSendReq(&me->sender_q);
+					if (req) {
+						printf("request taken: requestData: %p\n", (void*)req->pRequestData);
+					}
+				}
+			}
+		}
+}
+#endif
+
+
+static rsRetVal dequeueSendReq(sender_q_t *sender_q, omhttp_request_data_t **pRequestDataOut)
 {
 	sender_req_t *req = NULL;
 
@@ -124,16 +141,20 @@ static sender_req_t* dequeueSendReq(sender_q_t *sender_q)
 		req = STAILQ_FIRST(&sender_q->head);
 		STAILQ_REMOVE_HEAD(&sender_q->head, link);
 		sender_q->size--;
+		printf("dequeued requestdata: %p\n", req->pRequestData);
+		*pRequestDataOut = req->pRequestData;
+		free(req);
 		pthread_cond_signal(&(sender_q->cond_has_space));
 		printf("signalling there's room - size: %d\n", sender_q->size);
 	}
 	pthread_mutex_unlock(&sender_q->mut);
 
-	return req;
+	return 0;
 }
+#define WAITMS(x) \
+    struct timeval wait = { 0, (x)*1000 }; \
+    (void)select(0, NULL, NULL, NULL, &wait);
 
-
-//static ATTR_NORETURN void *startCaptureThread(void *sender_data) {
 static __attribute__((noreturn)) void *sender_task(void *data)
 {
 	sender_t* me = (sender_t*) data;
@@ -151,96 +172,84 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 
 	while (1)
 	{
-		sender_req_t *req = NULL;
-
-		if (me->runstate == 1 )
-#if 1
-		{
-			pthread_mutex_lock(&me->sender_q.mut);
-			size_t cur_size = me->sender_q.size;
-			pthread_mutex_unlock(&me->sender_q.mut);
-			printf(">>>> queue is shutting down!!! - items left: %d\n", cur_size);
-			if (cur_size > 0) {
-				// consume the rest
-				for (int i = 0; i < cur_size; ++i) {
-					req = dequeueSendReq(&me->sender_q);
-					if (req) {
-						printf("request taken: curl_h: %p\n", (void*)req->curl_h);
-					}
-				}
-			}
-		}
-#endif
 		int res = CURLM_OK;
-		req = NULL;
-
 		// get as long as there are items in
-		if (me->n_curl_handles < me->sender_q.capacity) {
-			req = dequeueSendReq(&me->sender_q);
+		for (int i = 0; i < me->n_curl_handles; ++i)
+		//for (int i = 0; i < 1; ++i)
+		{
+			omhttp_request_data_t *pRequestData = NULL;
+
+			dequeueSendReq(&me->sender_q, &pRequestData);
+			if (pRequestData) {
+#if 0
+				CURL *curl_h = me->curl_handles[i];
+				curl_easy_reset(curl_h);
+#else
+				CURL *curl_h = curl_easy_init();
+#endif
+				assert(curl_h != NULL);
+				if (me->curl_setup) {
+					me->curl_setup(curl_h, pRequestData);
+				}
+				//printf("request taken: requestData: %p\n", (void *)pRequestData);
+				CURLMcode mcode = curl_multi_add_handle(me->curlm, curl_h);
+				if (mcode != CURLM_OK) {
+					LogError(0, RS_RET_ERR,
+									 "omhttp_sender: error curl_multi_add_handle ret- %d:%s\n",
+									 mcode, curl_multi_strerror(mcode));
+					assert(0);
+				}
+			} else {
+				printf("empty request.\n");
+				break;
+			}
 		}
 
-		if (req) {
-			printf("request taken: curl_h: %p\n", (void*)req->curl_h);
-			/* this isn't thread safe */
-			#if 1
-			CURLMcode mcode = curl_multi_add_handle(me->curlm, req->curl_h);
-			if (mcode != CURLM_OK) {
-				LogError(0, RS_RET_ERR, "omhttp_sender: error curl_multi_add_handle ret- %d:%s\n",
-					mcode, curl_multi_strerror(mcode));
-				assert(0);
-			}
-			me->n_curl_handles++;
-			#endif
-		} else {
-			;
-			//printf("empty request.\n");
-		}
-		#if 1
 		{
+			int prev_still_running = still_running;
 			CURLMcode mc = curl_multi_perform(me->curlm, &still_running);
-			if (mc == CURLM_OK) {
-				res = curl_multi_wait(me->curlm, NULL, 0, 1000, &numfds);
+			int repeats = 0;
+			do {
+				int numfds;
+				printf("calling curl_multi_wait()...\n");
+				int res = curl_multi_wait(me->curlm, NULL, 0, 500, &numfds);
+				printf("woke up.\n");
 				if (res != CURLM_OK) {
-					LogError(0, RS_RET_ERR, "error: curl_multi_wait() numfds=%d, res=%d:%s\n",
-							numfds, res, curl_multi_strerror(res));
+					fprintf(stderr, "error: curl_multi_wait() returned %d\n", res);
+					break;
 				}
-				printf ("numfds returned: %d\n", numfds);
-				#if 0
+				mc = curl_multi_perform(me->curlm, &still_running);
+				if (mc != CURLM_OK) {
+					fprintf(stderr, "curl_multi failed, code %d\n", mc);
+					break;
+				}
+				printf("still_running: %d\n", still_running);
 				if (!numfds) {
-					repeats++; /* count number of repeated zero numfds */
+					repeats++;
 					if (repeats > 1) {
-						sleep(100); /* sleep 100 milliseconds */
+						WAITMS(100);
 					}
 				} else {
 					repeats = 0;
 				}
-				#endif
-			} else {
-				LogError(0, RS_RET_ERR, "error: curl_multi_perform() still_running=%d, res=%d:%s\n",
-								 still_running, res, curl_multi_strerror(res));
-			}
+			} while (still_running);
 
-			int prev_still_running = still_running;
-			//curl_multi_perform(me->curlm, &still_running);
-
-			printf("numfds: %d, prev: %d, still %d\n", numfds, prev_still_running, still_running);
-			//if (prev_still_running > still_running)
-			for (int i = 0; i < numfds; ++i)
 			{
-				printf("checking responses...\n");
-				//curl_multi_perform(me->curlm, &still_running);
-				int rc = 0, msgs_left = 0;
+				int msgs_left = 0;
 				CURLMsg *msg = NULL;
-				CURL *pCurl;
+				CURL *pCurl = NULL;
+				int rc = 0;
 
 				while ((msg = curl_multi_info_read(me->curlm, &msgs_left))) {
 					if (msg->msg == CURLMSG_DONE) {
 						pCurl = msg->easy_handle;
 						rc = msg->data.result;
 						if (rc != CURLE_OK) {
-							LogError(0, RS_RET_ERR, "omhttp: %s() - curl handle: %p, error code: %d:%s\n",
-											 __FUNCTION__, (void*)pCurl, rc, curl_multi_strerror(rc));
-							//assert(0);
+							LogError(0, RS_RET_ERR,
+											 "omhttp: %s() - curl handle: %p, error code: %d:%s\n",
+											 __FUNCTION__, (void *)pCurl, rc,
+											 curl_multi_strerror(rc));
+							// assert(0);
 							continue;
 						}
 
@@ -256,14 +265,16 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 							}
 						}
 						curl_multi_remove_handle(me->curlm, pCurl);
-						me->curl_complete(pCurl);
-						//curl_easy_cleanup(pCurl);
-						me->n_curl_handles--;
+#if 1
+						curl_easy_cleanup(pCurl);
+#else
+						//me->curl_complete(pCurl);
+						curl_easy_reset(pCurl);
+#endif
 					}
 				}
 			}
 		}
-		#endif
 		printf("iteration %d, 2xx responses: %d\n", ++i, count);
 	}
 	destroyIoQ(&me->sender_q);
@@ -272,35 +283,30 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 	printf("exiting thread.\n");
 	pthread_exit(0);
 }
-#if 0
-static rsRetVal
-omhttp_sender_task() {
-	int still_running = 0;
 
-	do {
-		int numfds = 0;
-		int res = CURLM_OK;
-
-		res = curl_multi_wait(curlm, fds, 0, 1, &ret);
-		if (res != CURLM_OK) {
-			LogError(0, RS_RET_ERR, "error: curl_multi_wait() numfds=%d, res=%d:%s\n",
-					numfds, res, curl_multi_strerror(res));
-		}
-
-	} while (still_running);
-}
-#endif
-
-//void init_sender(sender_t *sender, size_t capacity)
-void init_sender(sender_t *sender, size_t capacity, curl_complete_cb cb)
+void init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb)
 {
 	sender->tid = NULL;
 	sender->curlm = curl_multi_init();
 	sender->curl_handles = NULL;
 	sender->n_curl_handles = 0;
+	sender->curl_handles = calloc(capacity, sizeof(CURL*));
+#if 0
+	if (capacity - 1 >= 1)
+		sender->n_curl_handles = capacity-1;
+	else
+		sender->n_curl_handles = 1;
+#else
+	sender->n_curl_handles = capacity;
+#endif
 	sender->runstate = 0;
-	sender->curl_complete = cb;
+	sender->curl_setup = setup_cb;
+	sender->curl_complete = complete_cb;
 	initIoQ(&sender->sender_q, capacity);
+
+	for (int i = 0; i < sender->n_curl_handles; ++i) {
+		sender->curl_handles[i] = curl_easy_init();
+	}
 }
 
 void start_send_worker(sender_t *sender) {
