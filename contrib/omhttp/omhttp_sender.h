@@ -15,16 +15,26 @@ struct omhttp_batch_s {
 	size_t nmemb;		/* number of messages in batch (for statistics counting) */
 };
 
+typedef struct omhttp_request_data_s {
+	void *private_data; // Note access to this must be strictly synchronized
+	omhttp_batch_t batchData;
+	uchar* postData; // we can use this in case we want to manage the memory here. // may not be necessary.
+	size_t postLen; // we can use this in case we want to manage the memory here. // may not be necessary.
+	/* track the reply */
+	int replyLen;
+	char *reply;
+	long statusCode;
+	char *restUrl;
+} omhttp_request_data_t;
+
 // TODO: determine if we should leverage the BEGINinterface macros
 /* callback interfaces */
+typedef rsRetVal (*curl_setup_cb)(CURL* curl, omhttp_request_data_t *pRequestData);
 typedef rsRetVal (*curl_complete_cb)(CURL* curl);
 
 typedef struct sender_req_s {
 	STAILQ_ENTRY(sender_req_s) link;
-	CURL *curl_h; 	/* curl handle should have all appropriate curl options set already */
-	const void* private_data;
-	const char* buffer;
-	size_t bufsize;
+	omhttp_request_data_t *pRequestData;
 } sender_req_t;
 
 typedef struct sender_q_s {
@@ -52,13 +62,14 @@ struct sender_s {
 	sender_q_t sender_q;
 	const void *inst_data;
 	int runstate;
+	curl_setup_cb curl_setup;
 	curl_complete_cb curl_complete;
 };
 
-void init_sender(sender_t *sender, size_t capacity, curl_complete_cb cb);
+void init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb);
 void start_send_worker(sender_t *sender);
 void stop_send_worker(sender_t *sender);
-rsRetVal enqueueSendReq(sender_q_t *sender_q, CURL* curl, const void* private_data);
+rsRetVal enqueueSendReq(sender_q_t *sender_q, omhttp_request_data_t *pRequestData);
 
 
 

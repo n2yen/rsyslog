@@ -262,16 +262,34 @@ growCompressCtx(wrkrInstanceData_t *pWrkrData, size_t newLen);
 static rsRetVal ATTR_NONNULL()
 appendCompressCtx(wrkrInstanceData_t *pWrkrData, uchar *srcBuf, size_t srcLen);
 
-typedef struct omhttp_request_data_s {
-	wrkrInstanceData_t *pWrkrData; // Note access to this must be strictly synchronized
-	omhttp_batch_t batchData;
-	uchar* postData; // we can use this in case we want to manage the memory here. // may not be necessary.
-	size_t postLen; // we can use this in case we want to manage the memory here. // may not be necessary.
-	/* track the reply */
-	int replyLen;
-	char *reply;
-	long statusCode;
-} omhttp_request_data_t;
+/**
+ * private data that will be used to share some private data
+ * We'll need to define 2 things here.
+ * 1. An object which we can use to store what is in a batch. This object
+ * 	can later be used to submit any failed batches back into
+ *
+ * 2. we'll need to define a callback function, this is like a request complete
+ * 	callback. I think i've defined it somewhere here.
+ *
+ */
+static size_t
+omhttpSenderCurlResult(void *ptr, size_t size, size_t nmemb, void *userdata)
+{
+	printf("omhttpSenderCurlResult called\n");
+	char *p = (char*)ptr;
+	omhttp_request_data_t *pRequestData = (omhttp_request_data_t*)userdata;
+	char *buf;
+	size_t newlen;
+	newlen = pRequestData->replyLen + size * nmemb;
+	if ((buf = realloc(pRequestData->replyLen, newlen + 1)) == NULL) {
+		LogError(errno, RS_RET_ERR, "omhttp: realloc failed in curlResult");
+		return 0; /* abort due to failure */
+	}
+	memcpy(buf+pRequestData->replyLen, p, size*nmemb);
+	pRequestData->replyLen = newlen;
+	pRequestData->reply = buf;
+	return size*nmemb;
+}
 
 static rsRetVal
 omhttpSenderCheckResult(omhttp_request_data_t *pRequestData)
@@ -298,19 +316,80 @@ omhttpSenderCheckResult(omhttp_request_data_t *pRequestData)
 	return 0;
 }
 
+static void ATTR_NONNULL()
+curlSetupOmhttpSenderCommon(const wrkrInstanceData_t *const pWrkrData, CURL *const handle, omhttp_request_data_t *pReqData)
+{
+	//curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
+	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
+	//curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, omhttpSenderCurlResult);
+	//curl_easy_setopt(handle, CURLOPT_WRITEDATA, pReqData);
+#if 0
+	if(pWrkrData->pData->allowUnsignedCerts)
+		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
+	if(pWrkrData->pData->skipVerifyHost)
+		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYHOST, FALSE);
+	if(pWrkrData->pData->authBuf != NULL) {
+		curl_easy_setopt(handle, CURLOPT_USERPWD, pWrkrData->pData->authBuf);
+		curl_easy_setopt(handle, CURLOPT_PROXYAUTH, CURLAUTH_ANY);
+	}
+	if(pWrkrData->pData->caCertFile)
+		curl_easy_setopt(handle, CURLOPT_CAINFO, pWrkrData->pData->caCertFile);
+	if(pWrkrData->pData->myCertFile)
+		curl_easy_setopt(handle, CURLOPT_SSLCERT, pWrkrData->pData->myCertFile);
+	if(pWrkrData->pData->myPrivKeyFile)
+		curl_easy_setopt(handle, CURLOPT_SSLKEY, pWrkrData->pData->myPrivKeyFile);
+#endif
+	// uncomment for in-dept debuggung:
+	curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE);
+}
+
 /* multi-threaded related interfaces */
+static rsRetVal curl_setup_callback(CURL *curl_h, omhttp_request_data_t *pRequestData)
+{
+	DEFiRet;
+	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*)pRequestData->private_data;
+
+	curlSetupOmhttpSenderCommon(pWrkrData, curl_h, pRequestData);
+	// set post url, but use
+	curl_easy_setopt(curl_h, CURLOPT_URL, pRequestData->restUrl);
+
+	// TODO: optimize this, by freeing this batch data as part of the
+	// completion call.
+	// NOTE: size must be set prior to call to copy postfield
+	//printf("curl_setup_callback: postLen: %d\n", pRequestData->postLen);
+	printf("curl_setup_callback: postdata: %s\n", pRequestData->postData);
+	curl_easy_setopt(curl_h, CURLOPT_POSTFIELDSIZE, pRequestData->postLen);
+#if 1
+	curl_easy_setopt(curl_h, CURLOPT_COPYPOSTFIELDS, pRequestData->postData);
+#else
+	curl_easy_setopt(curl_h, CURLOPT_POSTFIELDS, pRequestData->postData);
+#endif
+	//curl_easy_setopt(curl_h, CURLOPT_PRIVATE, pRequestData);
+	//curl_easy_setopt(curl, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
+	//curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+
+	// curl code is now ready, submit this to our request queue.
+	// we can put the rest of this code into a completion function
+	//iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, curl, NULL);
+finalize_it:
+	RETiRet;
+}
+
 static rsRetVal curl_complete(CURL *curl)
 {
 	CURLcode code;
 	long statusCode;
-	//omhttp_request_data_t *pRequestData;
+	omhttp_request_data_t *pRequestData;
 
 	printf("curl_complete called - curl_h: %p\n", (void*)curl);
-	//code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
-	//printf("curl_easy_getinfo - private data: %d\n", code);
-	//assert(code == CURLE_OK);
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
-	printf("curl_complete - status: %d\n", statusCode);
+	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
+	printf("curl_easy_getinfo - private data: %d\n", code);
+	assert(code == CURLE_OK);
+	free(pRequestData);
+	//printf(">requested data: %p\n", (void*)pRequestData);
+	//printf(">> requested data: %s", pRequestData->postData);
+	//curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
+	//printf("curl_complete - status: %d\n", statusCode);
 
 	//omhttpSenderCheckResult(pRequestData);
 	curl_easy_cleanup(curl);
@@ -318,6 +397,7 @@ static rsRetVal curl_complete(CURL *curl)
 	// clean up private data
 	//free(pRequestData->postData);
 }
+
 
 BEGINcreateInstance
 CODESTARTcreateInstance
@@ -361,8 +441,7 @@ CODESTARTcreateWrkrInstance
 #if 1
 	pthread_mutex_init(&pWrkrData->mut, NULL);
 	// Let's initialize our sender thread
-	//init_sender(&pWrkrData->sender_thrd, pData->max_connections);
-	init_sender(&pWrkrData->sender_thrd, 10, curl_complete);
+	init_sender(&pWrkrData->sender_thrd, 5, curl_setup_callback, curl_complete);
 	// start worker
 	start_send_worker(&pWrkrData->sender_thrd);
 	// end
@@ -727,8 +806,7 @@ finalize_it:
 }
 
 static rsRetVal ATTR_NONNULL(1)
-setPostURLExternal(const wrkrInstanceData_t *const pWrkrData, uchar **const tpls,
-	CURL *curl, uchar **outRestURL)
+setPostURLExternal(const wrkrInstanceData_t *const pWrkrData, uchar **const tpls, uchar **outRestURL)
 {
 	uchar *restPath;
 	char* baseUrl;
@@ -767,9 +845,7 @@ setPostURLExternal(const wrkrInstanceData_t *const pWrkrData, uchar **const tpls
 		free(pWrkrData->restURL);
 
 	restURL = (uchar*)es_str2cstr(url, NULL);
-	curl_easy_setopt(curl, CURLOPT_URL, restURL);
 	DBGPRINTF("omhttp: using REST URL: '%s'\n", restURL);
-	printf("omhttp: using REST URL: '%s'\n", restURL);
 	*outRestURL = restURL;
 
 finalize_it:
@@ -1300,36 +1376,6 @@ finalize_it:
 }
 
 /**
- * private data that will be used to share some private data
- * We'll need to define 2 things here.
- * 1. An object which we can use to store what is in a batch. This object
- * 	can later be used to submit any failed batches back into
- *
- * 2. we'll need to define a callback function, this is like a request complete
- * 	callback. I think i've defined it somewhere here.
- *
- */
-
-static size_t
-omhttpSenderCurlResult(void *ptr, size_t size, size_t nmemb, void *userdata)
-{
-	printf("omhttpSenderCurlResult called\n");
-	char *p = (char*)ptr;
-	omhttp_request_data_t *pRequestData = (omhttp_request_data_t*)userdata;
-	char *buf;
-	size_t newlen;
-	newlen = pRequestData->replyLen + size * nmemb;
-	if ((buf = realloc(pRequestData->replyLen, newlen + 1)) == NULL) {
-		LogError(errno, RS_RET_ERR, "omhttp: realloc failed in curlResult");
-		return 0; /* abort due to failure */
-	}
-	memcpy(buf+pRequestData->replyLen, p, size*nmemb);
-	pRequestData->replyLen = newlen;
-	pRequestData->reply = buf;
-	return size*nmemb;
-}
-
-/**
  * Use the sender thread to post request data.
  * Pre-condition: A correctly set up `pWrkrData`
  * Post-condition: WrkrData may be modified with relevant updated data
@@ -1362,14 +1408,22 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 	DEFiRet;
 
 	CHKmalloc(curl = curl_easy_init());
-	PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
+	//PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
 	if(pWrkrData->pData->numServers > 1) {
 		/* needs to be called to support ES HA feature */
 		CHKiRet(checkConn(pWrkrData));
 	}
-
+#if 1
+	// set up the private cookie data
+	omhttp_request_data_t *pRequestData = (omhttp_request_data_t*) calloc(1, sizeof(omhttp_request_data_t));
+#endif
+#if 0
+	// curlsetupcommon
+	//curlSetupOmhttpSenderCommon(pWrkrData, curl, pRequestData);
+	curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
+#endif
 	// set post url, but use
-	CHKiRet(setPostURLExternal(pWrkrData, tpls, curl, &restURL));
+	CHKiRet(setPostURLExternal(pWrkrData, tpls, &pRequestData->restUrl));
 
 	pWrkrData->reply = NULL;
 	pWrkrData->replyLen = 0;
@@ -1379,6 +1433,9 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 	postLen = msglen;
 	compressed = 0;
 
+	pRequestData->postData = strdup(postData);
+	pRequestData->postLen = postLen;
+#if 0
 	if (pWrkrData->pData->compress) {
 		iRet = compressHttpPayload(pWrkrData, message, msglen);
 		if (iRet != RS_RET_OK) {
@@ -1391,8 +1448,6 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 		}
 	}
 	buildCurlHeaders(pWrkrData, compressed);
-
-	printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
 	// TODO: optimize this, by freeing this batch data as part of the
 	// completion call.
 	// NOTE: size must be set prior to call to copy postfield
@@ -1404,17 +1459,13 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 #endif
 	//curl_easy_setopt(curl, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
 	//curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
-
-	// set up the private cookie data
-	//omhttp_request_data_t *pRequestData = (omhttp_request_data_t*) calloc(1, sizeof(omhttp_request_data_t));
-	//pRequestData->postData = strdup(postData);
-	//pRequestData->postData = postLen;
-	//curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
-
 	// curl code is now ready, submit this to our request queue.
 	// we can put the rest of this code into a completion function
+#endif
+
+	printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
 	//iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, curl, NULL);
-	iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, curl, pWrkrData);
+	iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, pRequestData);
 
 finalize_it:
 	incrementServerIndex(pWrkrData);
@@ -1996,16 +2047,8 @@ curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle)
 	PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
 	curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
 	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
-	if (pWrkrData->use_sender) {
-		printf("using omhttpSenderCurlResult\n");
-		// this isn't working, we need to set a writedata option
-		curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, omhttpSenderCurlResult);
-	} else {
-		printf("using curlResult\n");
-		curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
-		curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
-	}
-	//curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
+	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
+	curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
 	if(pWrkrData->pData->allowUnsignedCerts)
 		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
 	if(pWrkrData->pData->skipVerifyHost)
