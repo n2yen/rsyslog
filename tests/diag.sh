@@ -2305,7 +2305,7 @@ omhttp_stop_server() {
     else
         echo "Stopping omhttp server"
         kill -9 $(cat ${omhttp_work_dir}/omhttp_server.pid) > /dev/null 2>&1
-        rm -rf $omhttp_work_dir
+        #rm -rf $omhttp_work_dir
     fi
 }
 
