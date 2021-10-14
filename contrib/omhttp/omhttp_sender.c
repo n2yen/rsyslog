@@ -6,6 +6,7 @@
 #include "omhttp_sender.h"
 #include "module-template.h"
 #include "glbl.h"
+#include <apr_pools.h>
 
 DEFobjCurrIf(glbl)
 
@@ -50,6 +51,44 @@ static void destroyIoQ(sender_q_t *sender_q)
 	pthread_cond_destroy(&sender_q->wakeup_worker);
 	pthread_cond_destroy(&sender_q->cond_has_space);
 	pthread_mutex_destroy(&sender_q->mut);
+}
+
+rsRetVal
+enqueueSendReq2(sender_t *sender, omhttp_request_data_t *pRequestData)
+{
+	DEFiRet;
+	apr_status_t apr_rv = APR_SUCCESS;
+	int i = 0,
+		max_tries = 10;
+
+	while (i++ < max_tries) {
+		apr_rv = apr_queue_push(sender->request_q, (void*)pRequestData);
+		if (apr_rv == APR_SUCCESS) {
+			printf("pushed into queue postdata: %s\n", pRequestData->postData);
+			break;
+		} else if (apr_rv == APR_EINTR) {
+			// retry
+			printf("enqueue EINTR: %d\n", apr_rv);
+			continue;
+		} else if (apr_rv == APR_EOF) {
+			// queue is terminated we should be shutting down.
+			printf("enqueue EOF: %d\n", apr_rv);
+			ABORT_FINALIZE(iRet = RS_RET_SUSPENDED);
+			break;
+		} else {
+			ABORT_FINALIZE(iRet = RS_RET_SUSPENDED);
+		}
+	}
+	assert(i < max_tries);
+
+finalize_it:
+	if (apr_rv != APR_SUCCESS) {
+		char buf[256];
+		printf("omhttp-sender: enqueue failed - iterations: %d, error: %d, %s\n", apr_rv, apr_strerror(apr_rv, buf, sizeof(buf)));
+		iRet = RS_RET_OUT_OF_MEMORY;
+		//assert(0);
+	}
+	RETiRet;
 }
 
 rsRetVal
@@ -125,6 +164,36 @@ static consumeRemainingRequests()
 }
 #endif
 
+static rsRetVal dequeueSendReq2(apr_queue_t *queue, omhttp_request_data_t **pRequestDataOut)
+{
+	DEFiRet;
+	apr_status_t apr_rv;
+	int i = 0,
+		max_tries = 3;
+	omhttp_request_data_t *pdata;
+
+	while (i++ < max_tries) {
+		apr_rv = apr_queue_trypop(queue, &pdata);
+		if (apr_rv == APR_SUCCESS) {
+			// done
+			*pRequestDataOut = pdata;
+			printf("dequeued postdata: %s\n", (*pRequestDataOut)->postData);
+			break;
+		} else if (apr_rv == APR_EINTR) {
+			// retry
+			continue;
+		} else if (apr_rv == APR_EOF) {
+			// queue shutdown
+			RS_RET_SENDER_GONE_AWAY;
+			break;
+		} else {
+			// unexpected
+			ABORT_FINALIZE(RS_RET_ERR);
+		}
+	}
+finalize_it:
+	RETiRet;
+}
 
 static rsRetVal dequeueSendReq(sender_q_t *sender_q, omhttp_request_data_t **pRequestDataOut)
 {
@@ -178,14 +247,17 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 		//for (int i = 0; i < 1; ++i)
 		{
 			omhttp_request_data_t *pRequestData = NULL;
-
+#if 1
+			dequeueSendReq2(me->request_q, &pRequestData);
+#else
 			dequeueSendReq(&me->sender_q, &pRequestData);
+#endif
 			if (pRequestData) {
-#if 0
+#if 1
+				CURL *curl_h = curl_easy_init();
+#else
 				CURL *curl_h = me->curl_handles[i];
 				curl_easy_reset(curl_h);
-#else
-				CURL *curl_h = curl_easy_init();
 #endif
 				assert(curl_h != NULL);
 				if (me->curl_setup) {
@@ -269,7 +341,8 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 						curl_easy_cleanup(pCurl);
 #else
 						//me->curl_complete(pCurl);
-						curl_easy_reset(pCurl);
+						//curl_easy_reset(pCurl);
+						me->curl_complete(pCurl);
 #endif
 					}
 				}
@@ -284,25 +357,33 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 	pthread_exit(0);
 }
 
-void init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb)
+static void init_apr(sender_t *sender) {
+	if (apr_initialize() != APR_SUCCESS) {
+		abort();
+	}
+	atexit(apr_terminate);
+
+	apr_pool_create(&sender->_pool, NULL);
+	apr_pool_tag(sender->_pool, "apr-util omhttp pool");
+}
+
+rsRetVal init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb)
 {
 	sender->tid = NULL;
 	sender->curlm = curl_multi_init();
 	sender->curl_handles = NULL;
 	sender->n_curl_handles = 0;
 	sender->curl_handles = calloc(capacity, sizeof(CURL*));
-#if 0
-	if (capacity - 1 >= 1)
-		sender->n_curl_handles = capacity-1;
-	else
-		sender->n_curl_handles = 1;
-#else
 	sender->n_curl_handles = capacity;
-#endif
+
 	sender->runstate = 0;
 	sender->curl_setup = setup_cb;
 	sender->curl_complete = complete_cb;
 	initIoQ(&sender->sender_q, capacity);
+	/* apr related stuff */
+	init_apr(sender);
+	apr_status_t apr_rv = apr_queue_create(&sender->request_q, capacity, sender->_pool);
+	assert(apr_rv == APR_SUCCESS);
 
 	for (int i = 0; i < sender->n_curl_handles; ++i) {
 		sender->curl_handles[i] = curl_easy_init();

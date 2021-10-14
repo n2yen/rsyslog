@@ -76,6 +76,7 @@ class MyHandler(BaseHTTPRequestHandler):
         else:
             post_data = raw_data
 
+        self.log_message("omhttp - received post_data: '{0}'".format(post_data))
         if self.path not in data:
             data[self.path] = []
         data[self.path].append(post_data.decode('utf-8'))

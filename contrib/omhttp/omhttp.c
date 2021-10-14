@@ -340,7 +340,7 @@ curlSetupOmhttpSenderCommon(const wrkrInstanceData_t *const pWrkrData, CURL *con
 		curl_easy_setopt(handle, CURLOPT_SSLKEY, pWrkrData->pData->myPrivKeyFile);
 #endif
 	// uncomment for in-dept debuggung:
-	curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE);
+	//curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE);
 }
 
 /* multi-threaded related interfaces */
@@ -392,7 +392,7 @@ static rsRetVal curl_complete(CURL *curl)
 	//printf("curl_complete - status: %d\n", statusCode);
 
 	//omhttpSenderCheckResult(pRequestData);
-	curl_easy_cleanup(curl);
+//	curl_easy_cleanup(curl);
 
 	// clean up private data
 	//free(pRequestData->postData);
@@ -1464,8 +1464,11 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 #endif
 
 	printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
-	//iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, curl, NULL);
+#if 1
+	iRet = enqueueSendReq2(&pWrkrData->sender_thrd, pRequestData);
+#else
 	iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, pRequestData);
+#endif
 
 finalize_it:
 	incrementServerIndex(pWrkrData);

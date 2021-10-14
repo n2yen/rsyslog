@@ -5,6 +5,12 @@
 . ${srcdir:=.}/diag.sh init
 
 export NUMMESSAGES=10000
+#export NUMMESSAGES=5
+#export NUMMESSAGES=20
+#export NUMMESSAGES=100
+#export NUMMESSAGES=500
+#export NUMMESSAGES=1000
+#export NUMMESSAGES=2000
 
 port="$(get_free_port)"
 omhttp_start_server $port
@@ -35,6 +41,9 @@ if $msg contains "msgnum:" then
 '
 startup
 injectmsg
+#sleep 2
+wait_queueempty
+echo "doing shutdown"
 shutdown_when_empty
 wait_shutdown
 omhttp_get_data $port my/endpoint

@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <sys/queue.h>
 #include <curl/curl.h>
+#include <apr_queue.h>
 
 typedef struct omhttp_batch_s omhttp_batch_t;
 
@@ -64,13 +65,15 @@ struct sender_s {
 	int runstate;
 	curl_setup_cb curl_setup;
 	curl_complete_cb curl_complete;
+	apr_queue_t *request_q;
+	apr_pool_t *_pool;
 };
 
-void init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb);
+rsRetVal init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb);
 void start_send_worker(sender_t *sender);
 void stop_send_worker(sender_t *sender);
 rsRetVal enqueueSendReq(sender_q_t *sender_q, omhttp_request_data_t *pRequestData);
-
+rsRetVal enqueueSendReq2(sender_t *sender, omhttp_request_data_t *pRequestData);
 
 
 #endif
