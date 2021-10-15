@@ -25,7 +25,8 @@ typedef struct omhttp_request_data_s {
 	int replyLen;
 	char *reply;
 	long statusCode;
-	char *restUrl;
+	uchar *restUrl;
+	char errbuf[CURL_ERROR_SIZE];
 } omhttp_request_data_t;
 
 // TODO: determine if we should leverage the BEGINinterface macros
@@ -72,8 +73,6 @@ struct sender_s {
 rsRetVal init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb);
 void start_send_worker(sender_t *sender);
 void stop_send_worker(sender_t *sender);
-rsRetVal enqueueSendReq(sender_q_t *sender_q, omhttp_request_data_t *pRequestData);
-rsRetVal enqueueSendReq2(sender_t *sender, omhttp_request_data_t *pRequestData);
-
+rsRetVal enqueueSendReq(sender_t *sender, omhttp_request_data_t *pRequestData);
 
 #endif
