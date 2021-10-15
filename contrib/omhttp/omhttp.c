@@ -294,6 +294,8 @@ omhttpSenderCurlResult(void *ptr, size_t size, size_t nmemb, void *userdata)
 static rsRetVal
 omhttpSenderCheckResult(omhttp_request_data_t *pRequestData)
 {
+	printf("omhttpSenderCheckResult \n");
+	printf("omhttpSenderCheckResult: %p\n", pRequestData);
 	if (!pRequestData) {
 		return 0;
 	}
@@ -321,8 +323,8 @@ curlSetupOmhttpSenderCommon(const wrkrInstanceData_t *const pWrkrData, CURL *con
 {
 	//curl_easy_setopt(handle, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
 	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
-	//curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, omhttpSenderCurlResult);
-	//curl_easy_setopt(handle, CURLOPT_WRITEDATA, pReqData);
+	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, omhttpSenderCurlResult);
+	curl_easy_setopt(handle, CURLOPT_WRITEDATA, pReqData);
 #if 0
 	if(pWrkrData->pData->allowUnsignedCerts)
 		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
@@ -353,18 +355,10 @@ static rsRetVal curl_setup_callback(CURL *curl, omhttp_request_data_t *pRequestD
 	// set post url, but use
 	curl_easy_setopt(curl, CURLOPT_URL, pRequestData->restUrl);
 
-	// TODO: optimize this, by freeing this batch data as part of the
-	// completion call.
-	// NOTE: size must be set prior to call to copy postfield
-	//printf("curl_setup_callback: postLen: %d\n", pRequestData->postLen);
 	printf("curl_setup_callback: postdata: %s\n", pRequestData->postData);
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, pRequestData->postLen);
-#if 1
-	curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, pRequestData->postData);
-#else
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, pRequestData->postData);
-#endif
-	//curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
+	curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
 	//curl_easy_setopt(curl, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
 	//curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
@@ -382,15 +376,17 @@ static rsRetVal curl_complete(CURL *curl)
 	omhttp_request_data_t *pRequestData;
 
 	printf("curl_complete called - curl: %p\n", (void*)curl);
+
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
+	pRequestData->statusCode = statusCode;
+	printf("curl_complete - status: %d\n", statusCode);
+
 	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
 	printf("curl_easy_getinfo - private data: %d\n", code);
 	assert(code == CURLE_OK);
+	omhttpSenderCheckResult(pRequestData);
 
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
-	printf("curl_complete - status: %d\n", statusCode);
-
-	//omhttpSenderCheckResult(pRequestData);
-
+	free(pRequestData->postData);
 	// clean up private data
 	free(pRequestData);
 }
@@ -1412,11 +1408,6 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 #if 1
 	// set up the private cookie data
 	omhttp_request_data_t *pRequestData = (omhttp_request_data_t*) calloc(1, sizeof(omhttp_request_data_t));
-#endif
-#if 0
-	// curlsetupcommon
-	//curlSetupOmhttpSenderCommon(pWrkrData, curl, pRequestData);
-	curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
 #endif
 	// set post url, but use
 	CHKiRet(setPostURLExternal(pWrkrData, tpls, &pRequestData->restUrl));
