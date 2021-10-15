@@ -298,7 +298,7 @@ omhttpSenderCheckResult(omhttp_request_data_t *pRequestData)
 		return 0;
 	}
 	// Grab the HTTP Response code
-	printf("omhttpSenderCheckResult - status: %d, requestData: %s\n", pRequestData->statusCode, pRequestData->postData);
+	printf("omhttpSenderCheckResult - status: %ld, requestData: %s\n", pRequestData->statusCode, pRequestData->postData);
 	if(pRequestData->reply == NULL) {
 		DBGPRINTF("omhttp: curlPost pRequestData reply==NULL, replyLen = '%d'\n",
 			pRequestData->replyLen);
@@ -344,27 +344,27 @@ curlSetupOmhttpSenderCommon(const wrkrInstanceData_t *const pWrkrData, CURL *con
 }
 
 /* multi-threaded related interfaces */
-static rsRetVal curl_setup_callback(CURL *curl_h, omhttp_request_data_t *pRequestData)
+static rsRetVal curl_setup_callback(CURL *curl, omhttp_request_data_t *pRequestData)
 {
 	DEFiRet;
 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*)pRequestData->private_data;
 
-	curlSetupOmhttpSenderCommon(pWrkrData, curl_h, pRequestData);
+	curlSetupOmhttpSenderCommon(pWrkrData, curl, pRequestData);
 	// set post url, but use
-	curl_easy_setopt(curl_h, CURLOPT_URL, pRequestData->restUrl);
+	curl_easy_setopt(curl, CURLOPT_URL, pRequestData->restUrl);
 
 	// TODO: optimize this, by freeing this batch data as part of the
 	// completion call.
 	// NOTE: size must be set prior to call to copy postfield
 	//printf("curl_setup_callback: postLen: %d\n", pRequestData->postLen);
 	printf("curl_setup_callback: postdata: %s\n", pRequestData->postData);
-	curl_easy_setopt(curl_h, CURLOPT_POSTFIELDSIZE, pRequestData->postLen);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, pRequestData->postLen);
 #if 1
-	curl_easy_setopt(curl_h, CURLOPT_COPYPOSTFIELDS, pRequestData->postData);
+	curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, pRequestData->postData);
 #else
-	curl_easy_setopt(curl_h, CURLOPT_POSTFIELDS, pRequestData->postData);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, pRequestData->postData);
 #endif
-	//curl_easy_setopt(curl_h, CURLOPT_PRIVATE, pRequestData);
+	//curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
 	//curl_easy_setopt(curl, CURLOPT_HTTPHEADER, pWrkrData->curlHeader);
 	//curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
@@ -381,21 +381,18 @@ static rsRetVal curl_complete(CURL *curl)
 	long statusCode;
 	omhttp_request_data_t *pRequestData;
 
-	printf("curl_complete called - curl_h: %p\n", (void*)curl);
+	printf("curl_complete called - curl: %p\n", (void*)curl);
 	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
 	printf("curl_easy_getinfo - private data: %d\n", code);
 	assert(code == CURLE_OK);
-	free(pRequestData);
-	//printf(">requested data: %p\n", (void*)pRequestData);
-	//printf(">> requested data: %s", pRequestData->postData);
-	//curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
-	//printf("curl_complete - status: %d\n", statusCode);
+
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
+	printf("curl_complete - status: %d\n", statusCode);
 
 	//omhttpSenderCheckResult(pRequestData);
-//	curl_easy_cleanup(curl);
 
 	// clean up private data
-	//free(pRequestData->postData);
+	free(pRequestData);
 }
 
 
@@ -439,7 +436,7 @@ CODESTARTcreateWrkrInstance
 	initCompressCtx(pWrkrData);
 	iRet = curlSetup(pWrkrData);
 #if 1
-	pthread_mutex_init(&pWrkrData->mut, NULL);
+	//pthread_mutex_init(&pWrkrData->mut, NULL);
 	// Let's initialize our sender thread
 	init_sender(&pWrkrData->sender_thrd, 5, curl_setup_callback, curl_complete);
 	// start worker
@@ -496,8 +493,9 @@ CODESTARTfreeWrkrInstance
 	curlCleanup(pWrkrData);
 
 	stop_send_worker(&pWrkrData->sender_thrd);
+#if 0
 	pthread_mutex_destroy(&pWrkrData->mut);
-
+#endif
 	free(pWrkrData->restURL);
 	pWrkrData->restURL = NULL;
 
@@ -1399,8 +1397,6 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 	 */
 
 	CURL *curl = NULL;
-	char errbuf[CURL_ERROR_SIZE] = "";
-
 	char *postData;
 	int postLen;
 	sbool compressed;
@@ -1464,11 +1460,7 @@ curlPostSender(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar 
 #endif
 
 	printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
-#if 1
-	iRet = enqueueSendReq2(&pWrkrData->sender_thrd, pRequestData);
-#else
-	iRet = enqueueSendReq(&pWrkrData->sender_thrd.sender_q, pRequestData);
-#endif
+	iRet = enqueueSendReq(&pWrkrData->sender_thrd, pRequestData);
 
 finalize_it:
 	incrementServerIndex(pWrkrData);
@@ -1910,7 +1902,7 @@ CODESTARTdoAction
 	uchar *restPath = NULL;
 	STATSCOUNTER_INC(ctrMessagesSubmitted, mutCtrMessagesSubmitted);
 
-	pthread_mutex_lock(&pWrkrData->mut);
+	//pthread_mutex_lock(&pWrkrData->mut);
 	if (pWrkrData->pData->batchMode) {
 		if(pData->dynRestPath) {
 			/* Get copy of restpath in batch mode if dynRestPath enabled */
@@ -1967,7 +1959,7 @@ CODESTARTdoAction
 		CHKiRet(curlPost(pWrkrData, ppString[0], strlen((char*)ppString[0]), ppString, 1));
 	}
 finalize_it:
-	pthread_mutex_unlock(&pWrkrData->mut);
+	//pthread_mutex_unlock(&pWrkrData->mut);
 ENDdoAction
 
 
