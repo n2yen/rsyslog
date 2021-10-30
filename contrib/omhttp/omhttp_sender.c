@@ -54,7 +54,7 @@ static void destroyIoQ(sender_q_t *sender_q)
 }
 
 rsRetVal
-enqueueSendReq(sender_t *sender, omhttp_request_data_t *pRequestData)
+enqueueSendReq(const sender_t *sender, omhttpRequestData_t *pRequestData)
 {
 	DEFiRet;
 	apr_status_t apr_rv = APR_SUCCESS;
@@ -92,14 +92,14 @@ finalize_it:
 	RETiRet;
 }
 
-static rsRetVal dequeueSendReq(sender_t *sender, omhttp_request_data_t **pRequestDataOut)
+static rsRetVal dequeueSendReq(sender_t *sender, omhttpRequestData_t **pRequestDataOut)
 {
 	DEFiRet;
 	apr_status_t apr_rv;
 	int i = 0,
 		max_tries = 3;
 	apr_queue_t *queue = sender->request_q;
-	omhttp_request_data_t *pdata;
+	omhttpRequestData_t *pdata;
 
 	while (i++ < max_tries) {
 		apr_rv = apr_queue_trypop(queue, (void*)&pdata);
@@ -164,11 +164,11 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 	int repeats = 0;
 	size_t num_easy = 0;
 	CURLMcode mcode;
-	while (1)
+	while (me->runstate != 1)
 	{
 		printf("current number of easy handles: %ld\n", num_easy);
 		while (num_easy < me->n_curl_handles) {
-			omhttp_request_data_t *pRequestData = NULL;
+			omhttpRequestData_t *pRequestData = NULL;
 
 			dequeueSendReq(me, &pRequestData);
 			if (pRequestData) {
@@ -179,8 +179,12 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 				curl_easy_reset(curl);
 #endif
 				assert(curl != NULL);
-				if (me->curl_setup) {
-					me->curl_setup(curl, pRequestData);
+				/* TODO: this needs to be moved to connection initialization */
+				if (me->curlPostSetup) {
+					me->curlPostSetup(curl, pRequestData, me->privateData);
+				}
+				if (me->curlPostSetOpts) {
+					me->curlPostSetOpts(curl, pRequestData, &me->zstrm, &me->compressCtx, me->privateData);
 				}
 				//printf("request taken: requestData: %p\n", (void *)pRequestData);
 				mcode = curl_multi_add_handle(me->curlm, curl);
@@ -208,18 +212,18 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 
 			repeats = 0;
 			//do {
-				printf("calling curl_multi_wait()...\n");
-				mcode = curl_multi_wait(me->curlm, NULL, 0, 500, &numfds);
-				printf("woke up.\n");
-				if (mcode != CURLM_OK) {
-					fprintf(stderr, "error: curl_multi_wait() returned %d\n", mcode);
-					break;
-				}
-				mcode = curl_multi_perform(me->curlm, &still_running);
-				if (mcode != CURLM_OK) {
-					fprintf(stderr, "curl_multi failed, code %d\n", mcode);
-					break;
-				}
+			printf("calling curl_multi_wait()...\n");
+			mcode = curl_multi_wait(me->curlm, NULL, 0, 500, &numfds);
+			printf("woke up.\n");
+			if (mcode != CURLM_OK) {
+				fprintf(stderr, "error: curl_multi_wait() returned %d\n", mcode);
+				break;
+			}
+			mcode = curl_multi_perform(me->curlm, &still_running);
+			if (mcode != CURLM_OK) {
+				fprintf(stderr, "curl_multi failed, code %d\n", mcode);
+				break;
+			}
 			//} while (still_running);
 
 				int msgs_left = 0;
@@ -240,9 +244,19 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 							continue;
 						}
 
+						// TODO: should we send the result as well?
+						me->curlPostComplete(pCurl, rc, me->privateData);
+
 						mcode = curl_multi_remove_handle(me->curlm, pCurl);
 						if (mcode == CURLM_OK) {
 							num_easy--;
+							// TODO: remove
+							count++;
+#if 1
+							curl_easy_cleanup(pCurl);
+#else
+							curl_easy_reset(pCurl);
+#endif
 						} else {
 							LogError(0, RS_RET_ERR,
 									"omhttp_sender: error curl_multi_remove_handle ret- %d:%s\n",
@@ -250,12 +264,6 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 							assert(0);
 						}
 					}
-					me->curl_complete(pCurl);
-#if 1
-					curl_easy_cleanup(pCurl);
-#else
-					curl_easy_reset(pCurl);
-#endif
 				}
 
 				if (!numfds) {
@@ -288,7 +296,9 @@ static void init_apr(sender_t *sender) {
 }
 
 rsRetVal
-init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_complete_cb complete_cb)
+omhttpSenderInit(sender_t *sender, size_t capacity,
+		curlPostSetupCb curlPostSetup, curlPostCompleteCb curlPostComplete, curlPostSetOptsCb curlPostSetOpts,
+		void *privateData)
 {
 	sender->tid = -1;
 	sender->curlm = curl_multi_init();
@@ -298,8 +308,14 @@ init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_comp
 	sender->n_curl_handles = capacity;
 
 	sender->runstate = 0;
-	sender->curl_setup = setup_cb;
-	sender->curl_complete = complete_cb;
+	sender->curlPostSetup = curlPostSetup;
+	sender->curlPostComplete = curlPostComplete;
+	sender->curlPostSetOpts = curlPostSetOpts;
+
+	sender->privateData = privateData;
+
+	_initCompressCtx(&sender->compressCtx);
+
 	initIoQ(&sender->sender_q, capacity);
 	/* apr related stuff */
 	init_apr(sender);
@@ -313,12 +329,13 @@ init_sender(sender_t *sender, size_t capacity, curl_setup_cb setup_cb, curl_comp
 }
 
 void start_send_worker(sender_t *sender) {
-	printf("starting worker thread...\n");
+	printf("!!!! starting worker thread: %s...\n", sender->name);
 	pthread_create(&sender->tid, NULL, sender_task, sender);
 }
 
 void stop_send_worker(sender_t *sender) {
-	printf("stopping worker thread...\n");
+	printf("!!!! stopping worker thread: %s !!!!\n", sender->name);
 	sender->runstate = 1;
+	apr_queue_term(sender->request_q);
 }
 // End new multi-threaded sender interface
