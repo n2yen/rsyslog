@@ -26,6 +26,7 @@ struct omhttpCompressCtx_s {
 
 
 typedef struct omhttpRequestData_s {
+	CURL *curl;
 	omhttpBatch_t batchData;
 	uchar* postData; // we can use this in case we want to manage the memory here. // may not be necessary.
 	size_t postLen; // we can use this in case we want to manage the memory here. // may not be necessary.
@@ -35,7 +36,6 @@ typedef struct omhttpRequestData_s {
 	long statusCode;
 	uchar *restUrl;
 	char errbuf[CURL_ERROR_SIZE];
-	CURL *curl;
 } omhttpRequestData_t;
 
 // TODO: determine if we should leverage the BEGINinterface macros

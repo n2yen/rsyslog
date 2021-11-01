@@ -153,8 +153,8 @@ typedef struct instanceConf_s {
 	struct instanceConf_s *next;
 
 	// sender specific characteristics
-	size_t max_connections;
-	sbool use_send_thread;
+	sbool bSenderThrd;
+	size_t senderThrdMaxConns;
 
 } instanceData;
 
@@ -196,11 +196,8 @@ typedef struct wrkrInstanceData {
 #endif
 	/* multi-threaded related meta-data */
 #if 1
-	// TODO:
-	// we need an array of batches up to maximum number of batches
 	// writer thread
-	sbool use_sender;
-	sender_t sender_thrd;
+	sender_t senderThrd;
 	// end writer thread stuff
 
 	// we don't need a mutex, instead use a rwlock
@@ -244,6 +241,8 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "retry.ruleset", eCmdHdlrString, 0 },
 	{ "ratelimit.interval", eCmdHdlrInt, 0 },
 	{ "ratelimit.burst", eCmdHdlrInt, 0 },
+	{ "senderthread", eCmdHdlrBinary, 0 },
+	{ "senderthread.maxconnections", eCmdHdlrInt, 0 },
 };
 static struct cnfparamblk actpblk =
 	{ CNFPARAMBLK_VERSION,
@@ -299,7 +298,7 @@ _buildCurlHeaders(const wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip,
 		struct curl_slist **out_curlHeader);
 
 static rsRetVal
-_checkResult(const wrkrInstanceData_t *pWrkrData,  omhttpBatch_t *batchData, uchar *restUrl,
+_checkResult(const wrkrInstanceData_t *pWrkrData, const omhttpBatch_t *batchData, uchar *restUrl,
 		CURLcode statusCode, char* reply, int replyLen, uchar *reqmsg);
 
 static size_t
@@ -334,14 +333,13 @@ finalize_it:
 static rsRetVal
 omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pRequestData)
 {
+	CURLcode curlCode;
+	char *errbuf = NULL;
 	DEFiRet;
 
-	if (!pRequestData) {
-		return 0;
-	}
-
-	// TODO: this code needs to be enabled:
-#if 0
+#if 1
+	curlCode = pRequestData->statusCode;
+	errbuf = pRequestData->errbuf;
 	DBGPRINTF("omhttp: curlPost curl returned %lld\n", (long long) curlCode);
 	STATSCOUNTER_INC(ctrHttpRequestCount, mutCtrHttpRequestCount);
 
@@ -353,7 +351,12 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 		// Check the result here too and retry if needed, then we should suspend
 		// Usually in batch mode we clobber any iRet values, but probably not a great
 		// idea to keep hitting a dead server. The http status code will be 0 at this point.
+#if 1
+		_checkResult(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
+				curlCode, pRequestData->reply, pRequestData->replyLen, pRequestData->postData);
+#else
 		checkResult(pWrkrData, message);
+#endif
 		ABORT_FINALIZE(RS_RET_SUSPENDED);
 	} else {
 		STATSCOUNTER_INC(ctrHttpRequestSuccess, mutCtrHttpRequestSuccess);
@@ -361,7 +364,7 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 #endif
 
 	// Grab the HTTP Response code
-	printf("omhttpSenderCheckResult - status: %ld, requestData: %s\n", pRequestData->statusCode, pRequestData->postData);
+	printf("omhttpSenderCheckResult - status: %ld, requestData: %s\n", curlCode, pRequestData->postData);
 	if(pRequestData->reply == NULL) {
 		DBGPRINTF("omhttp: curlPost pRequestData reply==NULL, replyLen = '%d'\n",
 			pRequestData->replyLen);
@@ -377,15 +380,11 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 		DBGPRINTF("omhttp: curlPost pRequestData reply: '%s'\n", pRequestData->reply);
 		printf("omhttp: curlPost pRequestData reply: '%s'\n", pRequestData->reply);
 	}
-#if 1
+
 	CHKiRet(_checkResult(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
 				pRequestData->statusCode, pRequestData->reply, pRequestData->replyLen, pRequestData->postData));
-#else
-	CHKiRet(_checkResult(pWrkrData, pRequestData, pRequestData->statusCode, pRequestData->reply, pRequestData->postData));
-#endif
 
 finalize_it:
-	// clean up the requestData somewhere.
 	RETiRet;
 }
 
@@ -446,14 +445,11 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 	// set post url, but use
 	curl_easy_setopt(curl, CURLOPT_URL, pRequestData->restUrl);
 
-	/* TODO: This needs to be enabled in order to handle compression */
-#if 1
 	uchar *message = pRequestData->postData;
 	int msglen = pRequestData->postLen;
 	uchar *postData = message;
 	int postLen = msglen;
 
-	//printf("omhttpSenderCurlPostCb: postdata: %s\n", postData);
 	if (pWrkrData->pData->compress) {
 		iRet = _compressHttpPayload(zstrm, compressionLevel, compressCtx, postData, postLen);
 		if (iRet != RS_RET_OK) {
@@ -465,12 +461,12 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 			DBGPRINTF("omhttp: curlPost compressed %d to %d bytes\n", msglen, postLen);
 		}
 	}
-#endif
 
-#if 1
 	struct curl_slist *curlHeader = NULL;
-	_buildCurlHeaders(pWrkrData, compressed, &curlHeader);
-#endif
+	CHKiRet_Hdlr(_buildCurlHeaders(pWrkrData, compressed, &curlHeader)) {
+		LogError(0, iRet, "omhttp: error allocating curl header slist, using previous one");
+		FINALIZE;
+	}
 
 	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postLen);
 	curl_easy_setopt(curl, CURLOPT_COPYPOSTFIELDS, postData);
@@ -481,10 +477,15 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, pRequestData->errbuf);
 
 	pthread_rwlock_unlock(&pWrkrData->rwlock);
+
+finalize_it:
+	if (iRet != RS_RET_OK) {
+	}
 	RETiRet;
 }
 
-static rsRetVal omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode result, void *privateData)
+static rsRetVal
+omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode result, void *privateData)
 {
 	CURLcode code;
 	long statusCode;
@@ -502,6 +503,10 @@ static rsRetVal omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode result, void
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
 	pRequestData->statusCode = statusCode;
 	printf("omhttpSenderCurlPostCompleteCb - status: %ld\n", statusCode);
+
+	if (!pRequestData) {
+		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
+	}
 
 	if (result != CURLE_OK) {
 		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
@@ -585,16 +590,23 @@ CODESTARTcreateWrkrInstance
 #if 1
 	//pthread_mutex_init(&pWrkrData->mut, NULL);
 	// Let's initialize our sender thread
-	pWrkrData->sender_thrd.name = ustrdup(pWrkrData->pData->tplName);
-	omhttpSenderInit(&pWrkrData->sender_thrd, 5, omhttpSenderCurlPostSetupCb, omhttpSenderCurlPostCompleteCb,
-			omhttpSenderCurlPostSetOptsCb, pWrkrData);
-	// start worker
-	start_send_worker(&pWrkrData->sender_thrd);
-	pWrkrData->use_sender = 1;
-	// TODO: make this conditional, do error checking here
-	pthread_rwlock_init(&pWrkrData->rwlock, NULL);
-	pWrkrData->rwlockInitialized = 1;
-	// end
+	pWrkrData->pData->bSenderThrd = 0;
+	pWrkrData->pData->senderThrdMaxConns = 2;
+	if (pWrkrData->pData->bSenderThrd) {
+		pWrkrData->senderThrd.name = ustrdup(pWrkrData->pData->tplName);
+		omhttpSenderInit(&pWrkrData->senderThrd,
+				pWrkrData->pData->senderThrdMaxConns,
+				omhttpSenderCurlPostSetupCb,
+				omhttpSenderCurlPostCompleteCb,
+				omhttpSenderCurlPostSetOptsCb,
+				pWrkrData);
+		// start worker
+		start_send_worker(&pWrkrData->senderThrd);
+		// TODO: make this conditional, do error checking here
+		pthread_rwlock_init(&pWrkrData->rwlock, NULL);
+		pWrkrData->rwlockInitialized = 1;
+		// end
+	}
 #endif
 
 ENDcreateWrkrInstance
@@ -645,7 +657,7 @@ BEGINfreeWrkrInstance
 CODESTARTfreeWrkrInstance
 	curlCleanup(pWrkrData);
 
-	stop_send_worker(&pWrkrData->sender_thrd);
+	stop_send_worker(&pWrkrData->senderThrd);
 #if 1
 	//pthread_mutex_destroy(&pWrkrData->mut);
 	if (pWrkrData->rwlockInitialized) {
@@ -1192,7 +1204,7 @@ finalize_it:
  * needs to be closed, HUP must be sent.
  */
 static rsRetVal ATTR_NONNULL()
-writeDataError(wrkrInstanceData_t *const pWrkrData,
+writeDataError(const wrkrInstanceData_t *const pWrkrData,
 	instanceData *const pData, uchar *const reqmsg)
 {
 #if 1
@@ -1252,7 +1264,7 @@ finalize_it:
 }
 
 static rsRetVal
-_queueBatchOnRetryRuleset(omhttpBatch_t *batch, instanceData *const pData)
+_queueBatchOnRetryRuleset(const omhttpBatch_t *batch, instanceData *const pData)
 {
 	uchar *msgData;
 	smsg_t *pMsg;
@@ -1294,7 +1306,7 @@ finalize_it:
 }
 
 static rsRetVal
-queueBatchOnRetryRuleset(wrkrInstanceData_t *const pWrkrData, instanceData *const pData)
+queueBatchOnRetryRuleset(const wrkrInstanceData_t *const pWrkrData, instanceData *const pData)
 {
 	uchar *msgData;
 	smsg_t *pMsg;
@@ -1334,7 +1346,7 @@ finalize_it:
  *
  */
 static rsRetVal
-_checkResult(const wrkrInstanceData_t *pWrkrData,  omhttpBatch_t *batchData, uchar *restUrl,
+_checkResult(const wrkrInstanceData_t *pWrkrData,  const omhttpBatch_t *batchData, uchar *restUrl,
 		CURLcode statusCode, char* reply, int replyLen, uchar *reqmsg)
 {
 	instanceData *pData;
@@ -1410,7 +1422,7 @@ finalize_it:
 }
 
 static rsRetVal
-checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg)
+checkResult(const wrkrInstanceData_t *pWrkrData, uchar *reqmsg)
 {
 	instanceData *pData;
 	long statusCode;
@@ -1419,8 +1431,9 @@ checkResult(wrkrInstanceData_t *pWrkrData, uchar *reqmsg)
 
 	pData = pWrkrData->pData;
 	statusCode = pWrkrData->httpStatusCode;
-#if 0
-	CHKiRet(_checkResult(pWrkrData, pWrkrData->batchData, pWrkrData->batch.restPath, ))
+#if 1
+	CHKiRet(_checkResult(pWrkrData, &pWrkrData->batch,
+		pWrkrData->restURL, statusCode, pWrkrData->reply, pWrkrData->replyLen, reqmsg));
 #else
 	if (pData->batchMode) {
 		numMessages = pWrkrData->batch.nmemb;
@@ -1822,10 +1835,6 @@ _buildCurlHeaders(const wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip, 
 	*out_curlHeader = slist;
 
 finalize_it:
-	if (iRet != RS_RET_OK) {
-		curl_slist_free_all(slist);
-		LogError(0, iRet, "omhttp: error allocating curl header slist, using previous one");
-	}
 	RETiRet;
 }
 
@@ -1847,7 +1856,10 @@ buildCurlHeaders(wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip)
 	pWrkrData->curlHeader = slist;
 
 finalize_it:
-
+	if (iRet != RS_RET_OK) {
+		curl_slist_free_all(slist);
+		LogError(0, iRet, "omhttp: error allocating curl header slist, using previous one");
+	}
 #else
 	if (pWrkrData->pData->httpcontenttype != NULL) {
 		// If content type specified use it, otherwise use a sane default
@@ -1964,7 +1976,7 @@ omhttpSenderCurlPost(const wrkrInstanceData_t *pWrkrData, uchar *message, int ms
 	omhttpBatchDeepCopy(pWrkrData, &pRequestData->batchData);
 
 	printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
-	iRet = enqueueSendReq(&pWrkrData->sender_thrd, pRequestData);
+	iRet = enqueueSendReq(&pWrkrData->senderThrd, pRequestData);
 
 finalize_it:
 	RETiRet;
@@ -2051,6 +2063,7 @@ _curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpl
 		//TODO: replyLen++? because 0 Byte is appended
 		DBGPRINTF("omhttp: curlPost pWrkrData reply: '%s'\n", pWrkrData->reply);
 	}
+	/* this code can contain common code */
 	CHKiRet(checkResult(pWrkrData, message));
 
 finalize_it:
@@ -2068,7 +2081,7 @@ curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpls
 {
 	DEFiRet;
 
-	if (pWrkrData->use_sender) {
+	if (pWrkrData->pData->bSenderThrd) {
 		// TODO: move this out of this function so we can be a read-only
 		if(pWrkrData->pData->numServers > 1) {
 			/* needs to be called to support ES HA feature */
@@ -2895,6 +2908,10 @@ CODESTARTnewActInst
 			pData->ratelimitBurst = (unsigned int) pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "ratelimit.interval")) {
 			pData->ratelimitInterval = (unsigned int) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "senderthread")) {
+			pData->bSenderThrd = pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "senderthread.maxconnections")) {
+			pData->senderThrdMaxConns = pvals[i].val.d.n;
 		} else {
 			LogError(0, RS_RET_INTERNAL_ERROR, "omhttp: program error, "
 				"non-handled param '%s'", actpblk.descr[i].name);
