@@ -27,6 +27,7 @@ struct omhttpCompressCtx_s {
 
 typedef struct omhttpRequestData_s {
 	CURL *curl;
+	struct curl_slist *curlHeader;	/* json POST request info */
 	omhttpBatch_t batchData;
 	uchar* postData; // we can use this in case we want to manage the memory here. // may not be necessary.
 	size_t postLen; // we can use this in case we want to manage the memory here. // may not be necessary.
@@ -76,9 +77,12 @@ struct sender_s {
 	pthread_t tid;
 	uchar *name;
 	CURLM *curlm;
-	CURL **curl_handles;
-	size_t n_curl_handles;
+	CURL **curlHandles;
+	size_t curlHandlesCount;
+	size_t curlHandlesCapacity;
+#if 0
 	sender_q_t sender_q;
+#endif
 	int runstate;
 	apr_queue_t *request_q;
 	apr_pool_t *_pool;
@@ -110,11 +114,14 @@ _freeCompressCtx(omhttpCompressCtx_t *compressCtx);
 /* end compress context */
 
 rsRetVal
-omhttpSenderInit(sender_t *sender, size_t capacity,
+omhttpSenderInit(sender_t *sender, size_t capacity, uchar *name,
 		curlPostSetupCb curlPostSetup, curlPostCompleteCb curlPostComplete, curlPostSetOptsCb curlPostSetOpts,
 		void *privateData);
+void omhttpSenderExit(sender_t *sender);
+#if 0
 void start_send_worker(sender_t *sender);
 void stop_send_worker(sender_t *sender);
+#endif
 rsRetVal enqueueSendReq(const sender_t *sender, omhttpRequestData_t *pRequestData);
 
 #endif

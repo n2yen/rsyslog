@@ -9,7 +9,7 @@
 #include <apr_pools.h>
 
 DEFobjCurrIf(glbl)
-
+#if 0
 static rsRetVal
 initIoQ(sender_q_t *sender_q, size_t capacity)
 {
@@ -52,6 +52,7 @@ static void destroyIoQ(sender_q_t *sender_q)
 	pthread_cond_destroy(&sender_q->cond_has_space);
 	pthread_mutex_destroy(&sender_q->mut);
 }
+#endif
 
 rsRetVal
 enqueueSendReq(const sender_t *sender, omhttpRequestData_t *pRequestData)
@@ -64,15 +65,15 @@ enqueueSendReq(const sender_t *sender, omhttpRequestData_t *pRequestData)
 	while (i++ < max_tries) {
 		apr_rv = apr_queue_push(sender->request_q, (void*)pRequestData);
 		if (apr_rv == APR_SUCCESS) {
-			printf("pushed into queue postdata: %s\n", pRequestData->postData);
+			//printf("pushed into queue postdata: %s\n", pRequestData->postData);
 			break;
 		} else if (apr_rv == APR_EINTR) {
 			// retry
-			printf("enqueue EINTR: %d\n", apr_rv);
+			//printf("enqueue EINTR: %d\n", apr_rv);
 			continue;
 		} else if (apr_rv == APR_EOF) {
 			// queue is terminated we should be shutting down.
-			printf("enqueue EOF: %d\n", apr_rv);
+			//printf("enqueue EOF: %d\n", apr_rv);
 			ABORT_FINALIZE(RS_RET_SUSPENDED);
 			break;
 		} else {
@@ -84,32 +85,42 @@ enqueueSendReq(const sender_t *sender, omhttpRequestData_t *pRequestData)
 finalize_it:
 	if (apr_rv != APR_SUCCESS) {
 		char buf[256];
-		printf("omhttp-sender: enqueue failed - iterations: %d, error: %d, %s\n",
-				i, apr_rv, apr_strerror(apr_rv, buf, sizeof(buf)));
+		//printf("omhttp-sender: enqueue failed - iterations: %d, error: %d, %s\n",
+		//		i, apr_rv, apr_strerror(apr_rv, buf, sizeof(buf)));
 		iRet = RS_RET_OUT_OF_MEMORY;
-		//assert(0);
+		assert(0);
 	}
 	RETiRet;
 }
 
-static rsRetVal dequeueSendReq(sender_t *sender, omhttpRequestData_t **pRequestDataOut)
+static rsRetVal dequeueSendReq(sender_t *sender, omhttpRequestData_t **pRequestDataOut, int tryonly)
 {
 	DEFiRet;
 	apr_status_t apr_rv;
 	int i = 0,
-		max_tries = 3;
+		max_tries = 1;
 	apr_queue_t *queue = sender->request_q;
 	omhttpRequestData_t *pdata;
 
 	while (i++ < max_tries) {
+#if 0
 		apr_rv = apr_queue_trypop(queue, (void*)&pdata);
+#else
+		if (tryonly) {
+			apr_rv = apr_queue_trypop(queue, (void*)&pdata);
+		} else {
+			//printf("doing a normal apr_queue_pop - queue size: %d\n.", apr_queue_size(queue));
+			apr_rv = apr_queue_pop(queue, (void*)&pdata);
+		}
+#endif
 		if (apr_rv == APR_SUCCESS) {
 			// done
 			*pRequestDataOut = pdata;
-			printf("dequeued postdata: %s\n", (*pRequestDataOut)->postData);
+			//printf("dequeued postdata: %s\n", (*pRequestDataOut)->postData);
 			break;
 		} else if (apr_rv == APR_EINTR) {
 			// retry
+			//printf("apr_queue_pop was interrupted.\n");
 			continue;
 		} else if (apr_rv == APR_EOF) {
 			// queue shutdown
@@ -166,16 +177,18 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 	CURLMcode mcode;
 	while (me->runstate != 1)
 	{
-		printf("current number of easy handles: %ld\n", num_easy);
-		while (num_easy < me->n_curl_handles) {
+		//fprintf(stderr, "current number of easy handles: %ld\n", num_easy);
+		while (apr_queue_size(me->request_q) && num_easy < me->curlHandlesCapacity) {
 			omhttpRequestData_t *pRequestData = NULL;
 
-			dequeueSendReq(me, &pRequestData);
+			//fprintf(stderr, "About to dequeue, num_easy connections: %d.\n", num_easy);
+			dequeueSendReq(me, &pRequestData, num_easy != 0);
 			if (pRequestData) {
-#if 1
+#define USE_CURL_RESET
+#ifndef USE_CURL_RESET
 				CURL *curl = curl_easy_init();
 #else
-				CURL *curl = me->curl_handles[i];
+				CURL *curl = me->curlHandles[num_easy];
 				curl_easy_reset(curl);
 #endif
 				assert(curl != NULL);
@@ -197,7 +210,7 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 					assert(0);
 				}
 			} else {
-				printf("empty request.\n");
+				//printf("empty request.\n");
 				break;
 			}
 		}
@@ -206,15 +219,17 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 			mcode = curl_multi_perform(me->curlm, &still_running);
 
 			if (still_running != prev_still_running) {
-				printf("still_running = %d\n", still_running);
+				//printf("still_running = %d\n", still_running);
 				prev_still_running = still_running;
 			}
 
 			repeats = 0;
 			//do {
-			printf("calling curl_multi_wait()...\n");
+			do {
+			//printf("calling curl_multi_wait()...\n");
+			numfds = 0;
 			mcode = curl_multi_wait(me->curlm, NULL, 0, 500, &numfds);
-			printf("woke up.\n");
+			//printf("woke up.\n");
 			if (mcode != CURLM_OK) {
 				fprintf(stderr, "error: curl_multi_wait() returned %d\n", mcode);
 				break;
@@ -224,68 +239,70 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 				fprintf(stderr, "curl_multi failed, code %d\n", mcode);
 				break;
 			}
+			} while (still_running);
 			//} while (still_running);
 
-				int msgs_left = 0;
-				CURLMsg *msg = NULL;
-				CURL *pCurl = NULL;
-				int rc = 0;
+			int msgs_left = 0;
+			CURLMsg *msg = NULL;
+			CURL *pCurl = NULL;
+			int rc = 0;
 
-				while ((msg = curl_multi_info_read(me->curlm, &msgs_left))) {
-					if (msg->msg == CURLMSG_DONE) {
-						pCurl = msg->easy_handle;
-						rc = msg->data.result;
-						if (rc != CURLE_OK) {
-							LogError(0, RS_RET_ERR,
-									"omhttp: %s() - curl handle: %p, error code: %d:%s\n",
-									__FUNCTION__, (void *)pCurl, rc,
-									curl_multi_strerror(rc));
-							// assert(0);
-							continue;
-						}
-
-						// TODO: should we send the result as well?
-						me->curlPostComplete(pCurl, rc, me->privateData);
-
-						mcode = curl_multi_remove_handle(me->curlm, pCurl);
-						if (mcode == CURLM_OK) {
-							num_easy--;
-							// TODO: remove
-							count++;
-#if 1
-							curl_easy_cleanup(pCurl);
-#else
-							curl_easy_reset(pCurl);
+			while ((msg = curl_multi_info_read(me->curlm, &msgs_left))) {
+				if (msg->msg == CURLMSG_DONE) {
+					pCurl = msg->easy_handle;
+					rc = msg->data.result;
+					// TODO: should we send the result as well?
+					me->curlPostComplete(pCurl, rc, me->privateData);
+					// TODO: verify this can be removed here.
+#if 0
+					if (rc != CURLE_OK) {
+						LogError(0, RS_RET_ERR,
+								"omhttp: %s() - curl handle: %p, error code: %d:%s\n",
+								__FUNCTION__, (void *)pCurl, rc,
+								curl_multi_strerror(rc));
+						// assert(0);
+						continue;
+					}
 #endif
-						} else {
-							LogError(0, RS_RET_ERR,
-									"omhttp_sender: error curl_multi_remove_handle ret- %d:%s\n",
-									mcode, curl_multi_strerror(mcode));
-							assert(0);
-						}
-					}
-				}
 
-				if (!numfds) {
-					repeats++;
-					if (repeats > 1) {
-						WAITMS(100);
+					mcode = curl_multi_remove_handle(me->curlm, pCurl);
+					if (mcode == CURLM_OK) {
+						num_easy--;
+						// TODO: remove
+						count++;
+#ifndef USE_CURL_RESET
+						curl_easy_cleanup(pCurl);
+#else
+						curl_easy_reset(pCurl);
+#endif
+					} else {
+						LogError(0, RS_RET_ERR,
+								"omhttp_sender: error curl_multi_remove_handle ret- %d:%s\n",
+								mcode, curl_multi_strerror(mcode));
+						assert(0);
 					}
-				} else {
-					repeats = 0;
 				}
 			}
 
-		printf("iteration %d, 2xx responses: %d\n", ++i, count);
-	}
-	destroyIoQ(&me->sender_q);
+			if (!numfds) {
+				repeats++;
+				if (repeats > 1) {
+					WAITMS(500);
+				}
+			} else {
+				repeats = 0;
+			}
+		}
 
-	printf("total successful 200s responses: %d\n", count);
-	printf("exiting thread.\n");
+		//printf("iteration %d, 2xx responses: %d\n", ++i, count);
+	}
+	fprintf(stderr, "total successful 200s responses: %d\n", count);
+	fprintf(stderr, "exiting thread.\n");
 	pthread_exit(0);
 }
 
-static void init_apr(sender_t *sender) {
+static void omhttpAprInit(sender_t *sender)
+{
 	if (apr_initialize() != APR_SUCCESS) {
 		abort();
 	}
@@ -295,17 +312,53 @@ static void init_apr(sender_t *sender) {
 	apr_pool_tag(sender->_pool, "apr-util omhttp pool");
 }
 
+static void omhttpAprExit(sender_t *sender)
+{
+	apr_pool_destroy(sender->_pool);
+}
+
+static void start_send_worker(sender_t *sender)
+{
+	// TODO: sender->tid needs to be needs to be locked
+	fprintf(stderr, "!!!! starting worker thread: %s...\n", sender->name);
+	pthread_create(&sender->tid, NULL, sender_task, sender);
+}
+
+static void stop_send_worker(sender_t *sender)
+{
+	fprintf(stderr, "!!!! stopping worker thread: %s !!!!\n", sender->name);
+	// TODO: This needs to be locked to prevent data race
+	sender->runstate = 1;
+	fprintf(stderr, "apr_queue_interrupt_all called...\n");
+	apr_queue_interrupt_all(sender->request_q);
+	fprintf(stderr, "apr_queue_interrupt_all done.\n");
+#if 1
+	void *res;
+	fprintf(stderr, "apr queue size: %d\n", apr_queue_size(sender->request_q));
+	fprintf(stderr, "joining thread!!!!\n");
+	int s = pthread_join(sender->tid, &res);
+	fprintf(stderr, "thread joined succesfully\n");
+	apr_queue_term(sender->request_q);
+	//if (s != 0)
+	//	handle_error_en(s, "pthread_join");
+
+	fprintf(stderr, "Joined with thread %d; returned value was %s\n",
+			sender->tid, (char *) res);
+	free(res);      /* Free memory allocated by thread */
+#endif
+}
+
 rsRetVal
-omhttpSenderInit(sender_t *sender, size_t capacity,
+omhttpSenderInit(sender_t *sender, size_t capacity, uchar *name,
 		curlPostSetupCb curlPostSetup, curlPostCompleteCb curlPostComplete, curlPostSetOptsCb curlPostSetOpts,
 		void *privateData)
 {
 	sender->tid = -1;
+	sender->name = (uchar*)strdup(name ? (char*)name : (char*)"");
 	sender->curlm = curl_multi_init();
-	sender->curl_handles = NULL;
-	sender->n_curl_handles = 0;
-	sender->curl_handles = calloc(capacity, sizeof(CURL*));
-	sender->n_curl_handles = capacity;
+	sender->curlHandlesCount = 0;
+	sender->curlHandles = calloc(capacity, sizeof(CURL*));
+	sender->curlHandlesCapacity = capacity;
 
 	sender->runstate = 0;
 	sender->curlPostSetup = curlPostSetup;
@@ -316,26 +369,32 @@ omhttpSenderInit(sender_t *sender, size_t capacity,
 
 	_initCompressCtx(&sender->compressCtx);
 
-	initIoQ(&sender->sender_q, capacity);
 	/* apr related stuff */
-	init_apr(sender);
+	omhttpAprInit(sender);
 	apr_status_t apr_rv = apr_queue_create(&sender->request_q, capacity, sender->_pool);
 	assert(apr_rv == APR_SUCCESS);
 
-	for (size_t i = 0; i < sender->n_curl_handles; ++i) {
-		sender->curl_handles[i] = curl_easy_init();
+	for (size_t i = 0; i < sender->curlHandlesCapacity; ++i) {
+		sender->curlHandles[i] = curl_easy_init();
 	}
+
+		// start worker
+	start_send_worker(sender);
 	return RS_RET_OK;
 }
 
-void start_send_worker(sender_t *sender) {
-	printf("!!!! starting worker thread: %s...\n", sender->name);
-	pthread_create(&sender->tid, NULL, sender_task, sender);
+void omhttpSenderExit(sender_t *sender)
+{
+	stop_send_worker(sender);
+	_freeCompressCtx(&sender->compressCtx);
+
+	for (int i = 0; i < sender->curlHandlesCapacity; ++i) {
+		curl_easy_cleanup(sender->curlHandles[i]);
+	}
+	free(sender->name);
+	free(sender->curlHandles);
+	curl_multi_cleanup(sender->curlm);
+	omhttpAprExit(sender);
 }
 
-void stop_send_worker(sender_t *sender) {
-	printf("!!!! stopping worker thread: %s !!!!\n", sender->name);
-	sender->runstate = 1;
-	apr_queue_term(sender->request_q);
-}
 // End new multi-threaded sender interface

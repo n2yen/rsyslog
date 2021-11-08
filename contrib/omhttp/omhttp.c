@@ -312,7 +312,6 @@ omhttpBatchDeepCopy(const wrkrInstanceData_t *pWrkrData, omhttpBatch_t *dst)
 	uchar **batchData;
 	DEFiRet;
 
-	//printf("omhttp - enter omhttpBatchShallowCopy(): copying %ld elements\n", pWrkrData->batch.nmemb);
 	if (pWrkrData->batch.nmemb > 0) {
 		CHKmalloc(batchData = (uchar **) malloc(pWrkrData->batch.nmemb * sizeof(uchar *)));
 		dst->data = batchData;
@@ -331,22 +330,22 @@ finalize_it:
 }
 
 static rsRetVal
-omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pRequestData)
+omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pRequestData, int curlCode)
 {
-	CURLcode curlCode;
 	char *errbuf = NULL;
 	DEFiRet;
 
-#if 1
-	curlCode = pRequestData->statusCode;
 	errbuf = pRequestData->errbuf;
+	// TODO: this needs to be enabled.
+#if 1
 	DBGPRINTF("omhttp: curlPost curl returned %lld\n", (long long) curlCode);
 	STATSCOUNTER_INC(ctrHttpRequestCount, mutCtrHttpRequestCount);
 
+	// TODO: fix this as we should be checking not the curl return code (this is status code).
 	if (curlCode != CURLE_OK) {
 		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
 		LogError(0, RS_RET_SUSPENDED,
-			"omhttp: suspending ourselves due to server failure %lld: %s",
+			"omhttp: 'senderCheckResult' suspending ourselves due to server failure %lld: %s",
 			(long long) curlCode, errbuf);
 		// Check the result here too and retry if needed, then we should suspend
 		// Usually in batch mode we clobber any iRet values, but probably not a great
@@ -364,12 +363,12 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 #endif
 
 	// Grab the HTTP Response code
-	printf("omhttpSenderCheckResult - status: %ld, requestData: %s\n", curlCode, pRequestData->postData);
+	//printf("omhttpSenderCheckResult - status: %ld, requestData: %s\n", pRequestData->statusCode, pRequestData->postData);
 	if(pRequestData->reply == NULL) {
 		DBGPRINTF("omhttp: curlPost pRequestData reply==NULL, replyLen = '%d'\n",
 			pRequestData->replyLen);
-		printf("omhttp: curlPost pRequestData reply==NULL, replyLen = '%d'\n",
-			pRequestData->replyLen);
+	//	printf("omhttp: curlPost pRequestData reply==NULL, replyLen = '%d'\n",
+	//		pRequestData->replyLen);
 	} else {
 		DBGPRINTF("omhttp: curlPost pRequestData replyLen = '%d'\n", pRequestData->replyLen);
 		if(pRequestData->replyLen > 0) {
@@ -378,7 +377,7 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 		}
 		//TODO: replyLen++? because 0 Byte is appended
 		DBGPRINTF("omhttp: curlPost pRequestData reply: '%s'\n", pRequestData->reply);
-		printf("omhttp: curlPost pRequestData reply: '%s'\n", pRequestData->reply);
+	//	printf("omhttp: curlPost pRequestData reply: '%s'\n", pRequestData->reply);
 	}
 
 	CHKiRet(_checkResult(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
@@ -462,8 +461,7 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 		}
 	}
 
-	struct curl_slist *curlHeader = NULL;
-	CHKiRet_Hdlr(_buildCurlHeaders(pWrkrData, compressed, &curlHeader)) {
+	CHKiRet_Hdlr(_buildCurlHeaders(pWrkrData, compressed, &pRequestData->curlHeader)) {
 		LogError(0, iRet, "omhttp: error allocating curl header slist, using previous one");
 		FINALIZE;
 	}
@@ -473,7 +471,7 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 	curl_easy_setopt(curl, CURLOPT_PRIVATE, pRequestData);
 
 	// TODO: validate if this ihas been initialized, this should get an slist
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curlHeader);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, pRequestData->curlHeader);
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, pRequestData->errbuf);
 
 	pthread_rwlock_unlock(&pWrkrData->rwlock);
@@ -485,7 +483,7 @@ finalize_it:
 }
 
 static rsRetVal
-omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode result, void *privateData)
+omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode curlResult, void *privateData)
 {
 	CURLcode code;
 	long statusCode;
@@ -493,22 +491,23 @@ omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode result, void *privateData)
 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*)privateData;
 	DEFiRet;
 
-	printf("omhttpSenderCurlPostCompleteCb called - curl: %p\n", (void*)curl);
+	//printf("omhttpSenderCurlPostCompleteCb called - curl: %p\n", (void*)curl);
 
 	pthread_rwlock_rdlock(&pWrkrData->rwlock);
 
 	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
-	printf("curl_easy_getinfo - private data: %d\n", code);
+	//printf("curl_easy_getinfo - private data: %d\n", code);
 	assert(code == CURLE_OK);
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
+	assert(pRequestData!=NULL);
+	code = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
 	pRequestData->statusCode = statusCode;
-	printf("omhttpSenderCurlPostCompleteCb - status: %ld\n", statusCode);
+	//printf("omhttpSenderCurlPostCompleteCb - status: %ld\n", statusCode);
 
 	if (!pRequestData) {
 		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
 	}
 
-	if (result != CURLE_OK) {
+	if (curlResult != CURLE_OK) {
 		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
 
 		code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
@@ -517,32 +516,41 @@ omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode result, void *privateData)
 			FINALIZE;
 		}
 
-		printf("curl_easy_getinfo - private data: %d\n", code);
+		//printf("curl_easy_getinfo - private data: %d\n", code);
 		LogError(0, RS_RET_SUSPENDED,
-			"omhttp: suspending ourselves due to server failure %lld: %s",
-			(long long) result, pRequestData->errbuf);
+			"omhttp: 'senderCurlCompleteCb' suspending ourselves due to server failure %lld: %s",
+			(long long) curlResult, pRequestData->errbuf);
 		// Check the result here too and retry if needed, then we should suspend
 		// Usually in batch mode we clobber any iRet values, but probably not a great
 		// idea to keep hitting a dead server. The http status code will be 0 at this point.
 
 #if 1
 		CHKiRet(_checkResult(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
-					result, pRequestData->reply, pRequestData->replyLen, pRequestData->postData));
+					curlResult, pRequestData->reply, pRequestData->replyLen, pRequestData->postData));
 #endif
 	} else {
 		STATSCOUNTER_INC(ctrHttpRequestSuccess, mutCtrHttpRequestSuccess);
 	}
 
-	CHKiRet(omhttpSenderCheckResult(pWrkrData, pRequestData));
+	CHKiRet(omhttpSenderCheckResult(pWrkrData, pRequestData, curlResult));
 
+	// clean up headers
+	curl_slist_free_all(pRequestData->curlHeader);
+	// clean up batch data
+	for (size_t i = 0; i < pRequestData->batchData.nmemb; ++i) {
+		free(pRequestData->batchData.data[i]);
+	}
+	free(pRequestData->batchData.data);
 	free(pRequestData->postData);
+	free(pRequestData->reply);
+	free(pRequestData->restUrl);
 	// clean up private data
 	free(pRequestData);
 
 finalize_it:
 	pthread_rwlock_unlock(&pWrkrData->rwlock);
 	if (iRet != RS_RET_OK) {
-		// This requires a lock
+		// This requires a write lock
 		pWrkrData->bIsSuspended = 1;
 	}
 	return 0;
@@ -590,21 +598,20 @@ CODESTARTcreateWrkrInstance
 #if 1
 	//pthread_mutex_init(&pWrkrData->mut, NULL);
 	// Let's initialize our sender thread
-	pWrkrData->pData->bSenderThrd = 0;
-	pWrkrData->pData->senderThrdMaxConns = 2;
+
+	//pWrkrData->pData->bSenderThrd = 0;
+	//pWrkrData->pData->senderThrdMaxConns = 3;
+	pthread_rwlock_init(&pWrkrData->rwlock, NULL);
+	pWrkrData->rwlockInitialized = 1;
 	if (pWrkrData->pData->bSenderThrd) {
-		pWrkrData->senderThrd.name = ustrdup(pWrkrData->pData->tplName);
 		omhttpSenderInit(&pWrkrData->senderThrd,
 				pWrkrData->pData->senderThrdMaxConns,
+				pWrkrData->pData->tplName,
 				omhttpSenderCurlPostSetupCb,
 				omhttpSenderCurlPostCompleteCb,
 				omhttpSenderCurlPostSetOptsCb,
 				pWrkrData);
-		// start worker
-		start_send_worker(&pWrkrData->senderThrd);
 		// TODO: make this conditional, do error checking here
-		pthread_rwlock_init(&pWrkrData->rwlock, NULL);
-		pWrkrData->rwlockInitialized = 1;
 		// end
 	}
 #endif
@@ -657,7 +664,11 @@ BEGINfreeWrkrInstance
 CODESTARTfreeWrkrInstance
 	curlCleanup(pWrkrData);
 
-	stop_send_worker(&pWrkrData->senderThrd);
+	fprintf(stderr, "!!! freeing worker instance.\n");
+	if (pWrkrData->pData->bSenderThrd) {
+		fprintf(stderr, "!!! calling sender exit now!\n");
+		omhttpSenderExit(&pWrkrData->senderThrd);
+	}
 #if 1
 	//pthread_mutex_destroy(&pWrkrData->mut);
 	if (pWrkrData->rwlockInitialized) {
@@ -1270,7 +1281,7 @@ _queueBatchOnRetryRuleset(const omhttpBatch_t *batch, instanceData *const pData)
 	smsg_t *pMsg;
 	DEFiRet;
 
-	printf("omhttp: enter _queueBatchOnRetryRuleset(): batch size: %ld\n", batch->nmemb);
+	//printf("omhttp: enter _queueBatchOnRetryRuleset(): batch size: %ld\n", batch->nmemb);
 
 	if (pData->retryRuleset == NULL) {
 		LogError(0, RS_RET_ERR, "omhttp: _queueBatchOnRetryRuleset invalid call with a NULL retryRuleset");
@@ -1355,6 +1366,7 @@ _checkResult(const wrkrInstanceData_t *pWrkrData,  const omhttpBatch_t *batchDat
 
 	pData = pWrkrData->pData;
 	if (pData->batchMode) {
+		// TODO: This needs to a read lock during read
 		numMessages = pWrkrData->batch.nmemb;
 	}
 
@@ -1387,8 +1399,8 @@ _checkResult(const wrkrInstanceData_t *pWrkrData,  const omhttpBatch_t *batchDat
 	if (iRet != RS_RET_OK) {
 		LogMsg(0, iRet, LOG_ERR, "omhttp: checkResult error http status code: %d reply: %s",
 			statusCode, reply != NULL ? reply : "NULL");
-		printf("omhttp: checkResult error http status code: %d reply: %s\n",
-			statusCode, reply != NULL ? reply : "NULL");
+		//printf("omhttp: checkResult error http status code: %d reply: %s\n",
+			//statusCode, reply != NULL ? reply : "NULL");
 
 #if 1
 		_writeDataError(restUrl, statusCode, reply, replyLen, pData, reqmsg);
@@ -1429,12 +1441,12 @@ checkResult(const wrkrInstanceData_t *pWrkrData, uchar *reqmsg)
 	size_t numMessages;
 	DEFiRet;
 
-	pData = pWrkrData->pData;
 	statusCode = pWrkrData->httpStatusCode;
 #if 1
 	CHKiRet(_checkResult(pWrkrData, &pWrkrData->batch,
 		pWrkrData->restURL, statusCode, pWrkrData->reply, pWrkrData->replyLen, reqmsg));
 #else
+	pData = pWrkrData->pData;
 	if (pData->batchMode) {
 		numMessages = pWrkrData->batch.nmemb;
 	} else {
@@ -1975,7 +1987,7 @@ omhttpSenderCurlPost(const wrkrInstanceData_t *pWrkrData, uchar *message, int ms
 
 	omhttpBatchDeepCopy(pWrkrData, &pRequestData->batchData);
 
-	printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
+	//printf ("omhttp: curlsetup submitting postdata: %s\n", postData);
 	iRet = enqueueSendReq(&pWrkrData->senderThrd, pRequestData);
 
 finalize_it:
@@ -2356,6 +2368,7 @@ omhttpBatchInitialize(omhttpBatch_t *batch)
 static void ATTR_NONNULL()
 initializeBatch(wrkrInstanceData_t *pWrkrData)
 {
+	// TODO: This thing needs to be locked during write.
 	pWrkrData->batch.sizeBytes = 0;
 	pWrkrData->batch.nmemb = 0;
 	if (pWrkrData->batch.restPath != NULL)  {
@@ -2411,7 +2424,7 @@ submitBatch(wrkrInstanceData_t *pWrkrData, uchar **tpls)
 		ABORT_FINALIZE(iRet);
 
 	DBGPRINTF("omhttp: submitBatch, batch: '%s' tpls: '%p'\n", batchBuf, tpls);
-	printf("omhttp: submitBatch, batch: '%s' tpls: '%p'\n", batchBuf, tpls);
+	//printf("omhttp: submitBatch, batch: '%s' tpls: '%p'\n", batchBuf, tpls);
 
 	CHKiRet(curlPost(pWrkrData, (uchar*) batchBuf, strlen(batchBuf),
 		tpls, pWrkrData->batch.nmemb));
@@ -2450,7 +2463,6 @@ CODESTARTdoAction
 	// NOTE: this is grossly bad, as we introduce possiblity of
 	// deadlock - we may need to be mroe targeted if we are using this.
 	// maybe only protect the batch stuff?
-	//pthread_rwlock_wrlock(&pWrkrData->rwlock);
 	if (pWrkrData->pData->batchMode) {
 		if(pData->dynRestPath) {
 			/* Get copy of restpath in batch mode if dynRestPath enabled */
@@ -2507,8 +2519,6 @@ CODESTARTdoAction
 		CHKiRet(curlPost(pWrkrData, ppString[0], strlen((char*)ppString[0]), ppString, 1));
 	}
 finalize_it:
-	//pthread_mutex_unlock(&pWrkrData->mut);
-	//pthread_rwlock_unlock(&pWrkrData->rwlock);
 ENDdoAction
 
 
