@@ -80,10 +80,8 @@ struct sender_s {
 	CURL **curlHandles;
 	size_t curlHandlesCount;
 	size_t curlHandlesCapacity;
-#if 0
-	sender_q_t sender_q;
-#endif
-	int runstate;
+	pthread_mutex_t mut;
+	sbool bShutdownWorker;
 	apr_queue_t *request_q;
 	apr_pool_t *_pool;
 	// private data provided by owner of the instance

@@ -9,6 +9,10 @@
 #include <apr_pools.h>
 
 DEFobjCurrIf(glbl)
+
+/* forward declarations */
+static sbool getShutdownState(sender_t *sender);
+
 #if 0
 static rsRetVal
 initIoQ(sender_q_t *sender_q, size_t capacity)
@@ -175,8 +179,11 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 	int repeats = 0;
 	size_t num_easy = 0;
 	CURLMcode mcode;
-	while (me->runstate != 1)
+	while (1)
 	{
+		if (getShutdownState(me)) {
+			break;
+		}
 		//fprintf(stderr, "current number of easy handles: %ld\n", num_easy);
 		while (apr_queue_size(me->request_q) && num_easy < me->curlHandlesCapacity) {
 			omhttpRequestData_t *pRequestData = NULL;
@@ -298,7 +305,8 @@ static __attribute__((noreturn)) void *sender_task(void *data)
 	}
 	fprintf(stderr, "total successful 200s responses: %d\n", count);
 	fprintf(stderr, "exiting thread.\n");
-	pthread_exit(0);
+
+	pthread_exit(NULL);
 }
 
 static void omhttpAprInit(sender_t *sender)
@@ -306,7 +314,6 @@ static void omhttpAprInit(sender_t *sender)
 	if (apr_initialize() != APR_SUCCESS) {
 		abort();
 	}
-	atexit(apr_terminate);
 
 	apr_pool_create(&sender->_pool, NULL);
 	apr_pool_tag(sender->_pool, "apr-util omhttp pool");
@@ -315,6 +322,7 @@ static void omhttpAprInit(sender_t *sender)
 static void omhttpAprExit(sender_t *sender)
 {
 	apr_pool_destroy(sender->_pool);
+	apr_terminate();
 }
 
 static void start_send_worker(sender_t *sender)
@@ -324,26 +332,44 @@ static void start_send_worker(sender_t *sender)
 	pthread_create(&sender->tid, NULL, sender_task, sender);
 }
 
+static sbool getShutdownState(sender_t *sender)
+{
+	sbool bShutdown = 0;
+	pthread_mutex_lock(&sender->mut);
+	bShutdown = sender->bShutdownWorker;
+	pthread_mutex_unlock(&sender->mut);
+	return bShutdown;
+}
+
+static sbool setShutdownState(sender_t *sender, sbool state)
+{
+	sbool bShutdown = 0;
+	pthread_mutex_lock(&sender->mut);
+	sender->bShutdownWorker = state;
+	pthread_mutex_unlock(&sender->mut);
+	return bShutdown;
+}
+
 static void stop_send_worker(sender_t *sender)
 {
 	fprintf(stderr, "!!!! stopping worker thread: %s !!!!\n", sender->name);
-	// TODO: This needs to be locked to prevent data race
-	sender->runstate = 1;
+	setShutdownState(sender, 1);
 	fprintf(stderr, "apr_queue_interrupt_all called...\n");
 	apr_queue_interrupt_all(sender->request_q);
 	fprintf(stderr, "apr_queue_interrupt_all done.\n");
+	apr_queue_term(sender->request_q);
 #if 1
 	void *res;
 	fprintf(stderr, "apr queue size: %d\n", apr_queue_size(sender->request_q));
 	fprintf(stderr, "joining thread!!!!\n");
 	int s = pthread_join(sender->tid, &res);
-	fprintf(stderr, "thread joined succesfully\n");
-	apr_queue_term(sender->request_q);
+	fprintf(stderr, "thread joined returned: %d\n", s);
 	//if (s != 0)
 	//	handle_error_en(s, "pthread_join");
-
+#if 0
 	fprintf(stderr, "Joined with thread %d; returned value was %s\n",
 			sender->tid, (char *) res);
+#endif
 	free(res);      /* Free memory allocated by thread */
 #endif
 }
@@ -360,12 +386,12 @@ omhttpSenderInit(sender_t *sender, size_t capacity, uchar *name,
 	sender->curlHandles = calloc(capacity, sizeof(CURL*));
 	sender->curlHandlesCapacity = capacity;
 
-	sender->runstate = 0;
+	sender->bShutdownWorker = 0;
 	sender->curlPostSetup = curlPostSetup;
 	sender->curlPostComplete = curlPostComplete;
 	sender->curlPostSetOpts = curlPostSetOpts;
-
 	sender->privateData = privateData;
+	pthread_mutex_init(&sender->mut, NULL);
 
 	_initCompressCtx(&sender->compressCtx);
 
@@ -380,6 +406,8 @@ omhttpSenderInit(sender_t *sender, size_t capacity, uchar *name,
 
 		// start worker
 	start_send_worker(sender);
+
+finalize_it:
 	return RS_RET_OK;
 }
 
@@ -388,7 +416,7 @@ void omhttpSenderExit(sender_t *sender)
 	stop_send_worker(sender);
 	_freeCompressCtx(&sender->compressCtx);
 
-	for (int i = 0; i < sender->curlHandlesCapacity; ++i) {
+	for (size_t i = 0; i < sender->curlHandlesCapacity; ++i) {
 		curl_easy_cleanup(sender->curlHandles[i]);
 	}
 	free(sender->name);

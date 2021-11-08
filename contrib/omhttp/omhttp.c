@@ -336,7 +336,7 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 	DEFiRet;
 
 	errbuf = pRequestData->errbuf;
-	// TODO: this needs to be enabled.
+	pthread_rwlock_wrlock(&pWrkrData->rwlock);
 #if 1
 	DBGPRINTF("omhttp: curlPost curl returned %lld\n", (long long) curlCode);
 	STATSCOUNTER_INC(ctrHttpRequestCount, mutCtrHttpRequestCount);
@@ -384,6 +384,7 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 				pRequestData->statusCode, pRequestData->reply, pRequestData->replyLen, pRequestData->postData));
 
 finalize_it:
+	pthread_rwlock_unlock(&pWrkrData->rwlock);
 	RETiRet;
 }
 
@@ -493,7 +494,7 @@ omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode curlResult, void *privateDat
 
 	//printf("omhttpSenderCurlPostCompleteCb called - curl: %p\n", (void*)curl);
 
-	pthread_rwlock_rdlock(&pWrkrData->rwlock);
+	//pthread_rwlock_rdlock(&pWrkrData->rwlock);
 
 	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
 	//printf("curl_easy_getinfo - private data: %d\n", code);
@@ -525,8 +526,10 @@ omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode curlResult, void *privateDat
 		// idea to keep hitting a dead server. The http status code will be 0 at this point.
 
 #if 1
+		pthread_rwlock_rdlock(&pWrkrData->rwlock);
 		CHKiRet(_checkResult(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
 					curlResult, pRequestData->reply, pRequestData->replyLen, pRequestData->postData));
+		pthread_rwlock_unlock(&pWrkrData->rwlock);
 #endif
 	} else {
 		STATSCOUNTER_INC(ctrHttpRequestSuccess, mutCtrHttpRequestSuccess);
@@ -548,7 +551,7 @@ omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode curlResult, void *privateDat
 	free(pRequestData);
 
 finalize_it:
-	pthread_rwlock_unlock(&pWrkrData->rwlock);
+	//pthread_rwlock_unlock(&pWrkrData->rwlock);
 	if (iRet != RS_RET_OK) {
 		// This requires a write lock
 		pWrkrData->bIsSuspended = 1;
@@ -669,12 +672,11 @@ CODESTARTfreeWrkrInstance
 		fprintf(stderr, "!!! calling sender exit now!\n");
 		omhttpSenderExit(&pWrkrData->senderThrd);
 	}
-#if 1
-	//pthread_mutex_destroy(&pWrkrData->mut);
+
 	if (pWrkrData->rwlockInitialized) {
 		pthread_rwlock_destroy(&pWrkrData->rwlock);
 	}
-#endif
+
 	free(pWrkrData->restURL);
 	pWrkrData->restURL = NULL;
 
@@ -1367,7 +1369,9 @@ _checkResult(const wrkrInstanceData_t *pWrkrData,  const omhttpBatch_t *batchDat
 	pData = pWrkrData->pData;
 	if (pData->batchMode) {
 		// TODO: This needs to a read lock during read
+		//pthread_rwlock_rdlock(&pWrkrData->rwlock);
 		numMessages = pWrkrData->batch.nmemb;
+		//pthread_rwlock_unlock(&pWrkrData->rwlock);
 	}
 
 	// 500+ errors return RS_RET_SUSPENDED if NOT batchMode and should be retried
@@ -2369,12 +2373,14 @@ static void ATTR_NONNULL()
 initializeBatch(wrkrInstanceData_t *pWrkrData)
 {
 	// TODO: This thing needs to be locked during write.
+	pthread_rwlock_wrlock(&pWrkrData->rwlock);
 	pWrkrData->batch.sizeBytes = 0;
 	pWrkrData->batch.nmemb = 0;
 	if (pWrkrData->batch.restPath != NULL)  {
 		free(pWrkrData->batch.restPath);
 		pWrkrData->batch.restPath = NULL;
 	}
+	pthread_rwlock_unlock(&pWrkrData->rwlock);
 }
 
 /* Adds a message to this worker's batch
@@ -2384,6 +2390,7 @@ buildBatch(wrkrInstanceData_t *pWrkrData, uchar *message)
 {
 	DEFiRet;
 
+	pthread_rwlock_wrlock(&pWrkrData->rwlock);
 	if (pWrkrData->batch.nmemb >= pWrkrData->pData->maxBatchSize) {
 		LogError(0, RS_RET_ERR, "omhttp: buildBatch something has gone wrong,"
 			"number of messages in batch is bigger than the max batch size, bailing");
@@ -2394,6 +2401,7 @@ buildBatch(wrkrInstanceData_t *pWrkrData, uchar *message)
 	pWrkrData->batch.nmemb++;
 
 finalize_it:
+	pthread_rwlock_unlock(&pWrkrData->rwlock);
 	RETiRet;
 }
 
