@@ -177,25 +177,10 @@ typedef struct wrkrInstanceData {
 	uchar *restURL;		/* last used URL for error reporting */
 	sbool bzInitDone;
 	z_stream zstrm; /* zip stream to use for gzip http compression */
-#if 1
 	omhttpBatch_t batch;
 	omhttpCompressCtx_t compressCtx;
-#else
-	struct {
-		uchar **data;		/* array of strings, this will be batched up lazily */
-		uchar *restPath;	/* Helper for restpath in batch mode */
-		size_t sizeBytes;	/* total length of this batch in bytes */
-		size_t nmemb;		/* number of messages in batch (for statistics counting) */
-
-	} batch;
-	struct {
-		uchar *buf;
-		size_t curLen;
-		size_t len;
-	} compressCtx;
-#endif
 	/* multi-threaded related meta-data */
-#if 1
+
 	// writer thread
 	sender_t senderThrd;
 	// end writer thread stuff
@@ -204,7 +189,6 @@ typedef struct wrkrInstanceData {
 	sbool rwlockInitialized;
 	pthread_rwlock_t rwlock;
 	sbool bIsSuspended;
-#endif
 } wrkrInstanceData_t;
 
 /* tables for interfacing with the v6 config system */
@@ -380,7 +364,7 @@ finalize_it:
 }
 
 static CURLcode ATTR_NONNULL()
-_omhttpSenderCurlSetup(const wrkrInstanceData_t *const pWrkrData, omhttpRequestData_t *pRequestData, CURL *const curlPostHandle)
+omhttpSenderCurlSetup(const wrkrInstanceData_t *const pWrkrData, omhttpRequestData_t *pRequestData, CURL *const curlPostHandle)
 {
 	CURLcode code;
 	code = _curlPostSetup(pWrkrData, curlPostHandle);
@@ -397,7 +381,7 @@ omhttpSenderCurlPostSetupCb(CURL *curl, omhttpRequestData_t *pRequestData, void 
 {
 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*)privateData;
 	pthread_rwlock_rdlock(&pWrkrData->rwlock);
-	_omhttpSenderCurlSetup(pWrkrData, pRequestData, curl);
+	omhttpSenderCurlSetup(pWrkrData, pRequestData, curl);
 	pthread_rwlock_unlock(&pWrkrData->rwlock);
 	return RS_RET_OK;
 }
@@ -1516,6 +1500,10 @@ finalize_it:
 	RETiRet;
 }
 
+/* Some duplicate code to curlSetup, but we need to add the gzip content-encoding
+ * header at runtime, and if the compression fails, we do not want to send it.
+ * Additionally, the curlCheckConnHandle should not be configured with a gzip header.
+ */
 static rsRetVal ATTR_NONNULL()
 _buildCurlHeaders(const wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip, struct curl_slist **out_curlHeader)
 {
@@ -1580,10 +1568,6 @@ finalize_it:
 	RETiRet;
 }
 
-/* Some duplicate code to curlSetup, but we need to add the gzip content-encoding
- * header at runtime, and if the compression fails, we do not want to send it.
- * Additionally, the curlCheckConnHandle should not be configured with a gzip header.
- */
 static rsRetVal ATTR_NONNULL()
 buildCurlHeaders(wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip)
 {
@@ -1611,9 +1595,6 @@ finalize_it:
  * Post-condition: WrkrData may be modified with relevant updated data
  * however, in this case, all of this data will be forwarded to the batch
  * request queue.
- *
- * Should we forward the entire Wrkrinstance? That would mean we would need to lock on
- * each of the
  *
  */
 static rsRetVal ATTR_NONNULL(1, 2)
@@ -1726,7 +1707,6 @@ _curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpl
 		//TODO: replyLen++? because 0 Byte is appended
 		DBGPRINTF("omhttp: curlPost pWrkrData reply: '%s'\n", pWrkrData->reply);
 	}
-	/* this code can contain common code */
 	CHKiRet(checkResult(pWrkrData, message));
 
 finalize_it:
@@ -1749,8 +1729,6 @@ curlPost(wrkrInstanceData_t *pWrkrData, uchar *message, int msglen, uchar **tpls
 			/* needs to be called to support ES HA feature */
 			CHKiRet(checkConn(pWrkrData));
 		}
-		// TODO: incrementServerIndex support needs to be added - this may need
-		//  to be part of the curl post setup - may require a mutex.
 		iRet = omhttpSenderCurlPost(pWrkrData, message, msglen, tpls, nmsgs);
 		incrementServerIndex(pWrkrData);
 		FINALIZE;
@@ -2035,7 +2013,9 @@ buildBatch(wrkrInstanceData_t *pWrkrData, uchar *message)
 {
 	DEFiRet;
 
-	pthread_rwlock_wrlock(&pWrkrData->rwlock);
+	if (pWrkrData->rwlockInitialized) {
+		pthread_rwlock_wrlock(&pWrkrData->rwlock);
+	}
 	if (pWrkrData->batch.nmemb >= pWrkrData->pData->maxBatchSize) {
 		LogError(0, RS_RET_ERR, "omhttp: buildBatch something has gone wrong,"
 			"number of messages in batch is bigger than the max batch size, bailing");
@@ -2046,7 +2026,9 @@ buildBatch(wrkrInstanceData_t *pWrkrData, uchar *message)
 	pWrkrData->batch.nmemb++;
 
 finalize_it:
-	pthread_rwlock_unlock(&pWrkrData->rwlock);
+	if (pWrkrData->rwlockInitialized) {
+		pthread_rwlock_unlock(&pWrkrData->rwlock);
+	}
 	RETiRet;
 }
 
@@ -2263,8 +2245,8 @@ _curlSetupCommon(const wrkrInstanceData_t *const pWrkrData, CURL *const handle)
 		curl_easy_setopt(handle, CURLOPT_SSLCERT, pWrkrData->pData->myCertFile);
 	if(pWrkrData->pData->myPrivKeyFile)
 		curl_easy_setopt(handle, CURLOPT_SSLKEY, pWrkrData->pData->myPrivKeyFile);
-	/* uncomment for in-dept debuggung: */
-	//curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE);
+	/* uncomment for in-dept debuggung:
+	curl_easy_setopt(handle, CURLOPT_VERBOSE, TRUE); */
 }
 
 static void ATTR_NONNULL()

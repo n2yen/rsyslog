@@ -123,13 +123,6 @@ static __attribute__((noreturn)) void *senderTask(void *data)
 			}
 		}
 
-#if 0
-			mcode = curl_multi_perform(me->curlm, &still_running);
-
-			if (still_running != prev_still_running) {
-				prev_still_running = still_running;
-			}
-#endif
 		repeats = 0;
 		do {
 			numfds = 0;
