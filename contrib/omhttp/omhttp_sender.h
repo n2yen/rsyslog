@@ -24,7 +24,6 @@ struct omhttpCompressCtx_s {
 		size_t len;
 };
 
-
 typedef struct omhttpRequestData_s {
 	CURL *curl;
 	struct curl_slist *curlHeader;	/* json POST request info */
@@ -39,7 +38,6 @@ typedef struct omhttpRequestData_s {
 	char errbuf[CURL_ERROR_SIZE];
 } omhttpRequestData_t;
 
-// TODO: determine if we should leverage the BEGINinterface macros
 /* callback interfaces */
 typedef rsRetVal (*curlPostSetupCb)(CURL* curl, omhttpRequestData_t *pRequestData, void *privateData);
 typedef rsRetVal (*curlPostCompleteCb)(CURL* curl, CURLcode result, void *privateData);
@@ -58,7 +56,7 @@ typedef struct sender_req_s {
 typedef struct sender_q_s {
 	STAILQ_HEAD(senderQ_s, sender_req_s) head;
 	int capacity;
-	int size; //current q size
+	int size; 	//current q size
 	pthread_mutex_t mut;
 	pthread_cond_t wakeup_worker; // needed to implement forced wake up from another thread
 	pthread_cond_t cond_has_space;
@@ -80,27 +78,22 @@ struct sender_s {
 	CURL **curlHandles;
 	size_t curlHandlesCount;
 	size_t curlHandlesCapacity;
-	pthread_mutex_t mut;
-	sbool bShutdownWorker;
+	size_t processedRequests;
 	apr_queue_t *request_q;
 	apr_pool_t *_pool;
-	// private data provided by owner of the instance
-	// actually not needed, perhaps this is just something
-	// that can be guarded on the owner's side. doing that will
-	// require that owner is guarding everything with a mutex
-	// This would complicate code much more with a bunch of
-	// locks just to support this.
+	pthread_mutex_t mut;
+	sbool bShutdownWorker;
 	void *privateData;
 
-	// Supported interfaces
+	/* compression */
+	z_stream zstrm; /* zip stream to use for gzip http compression */
+	omhttpCompressCtx_t compressCtx;
+
+	// sender interface
 	curlPostSetupCb curlPostSetup;
 	curlPostCompleteCb curlPostComplete;
 	curlPostSetOptsCb curlPostSetOpts;
-	// end Interfaces
-
-	/* compression related */
-	z_stream zstrm; /* zip stream to use for gzip http compression */
-	omhttpCompressCtx_t compressCtx;
+	// end interface
 };
 
 /* compress context */
@@ -116,10 +109,6 @@ omhttpSenderInit(sender_t *sender, size_t capacity, uchar *name,
 		curlPostSetupCb curlPostSetup, curlPostCompleteCb curlPostComplete, curlPostSetOptsCb curlPostSetOpts,
 		void *privateData);
 void omhttpSenderExit(sender_t *sender);
-#if 0
-void start_send_worker(sender_t *sender);
-void stop_send_worker(sender_t *sender);
-#endif
 rsRetVal enqueueSendReq(const sender_t *sender, omhttpRequestData_t *pRequestData);
 
 #endif
