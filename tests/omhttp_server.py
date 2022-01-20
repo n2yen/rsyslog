@@ -12,9 +12,9 @@ except ImportError:
 
 # Keep track of data received at each path
 data = {}
-
+data_compress = {}
 metadata = {'posts': 0, 'fail_after': 0, 'fail_every': -1, 'decompress': False, 'userpwd': ''}
-
+Debug = 0
 
 class MyHandler(BaseHTTPRequestHandler):
     """
@@ -71,12 +71,16 @@ class MyHandler(BaseHTTPRequestHandler):
         content_length = int(self.headers['Content-Length'] or 0)
         raw_data = self.rfile.read(content_length)
 
+        if self.path not in data_compress:
+            data_compress[self.path] = []
+        data_compress[self.path].append(raw_data)
+
         if metadata['decompress']:
             post_data = zlib.decompress(raw_data, 31)
         else:
             post_data = raw_data
 
-        self.log_message("omhttp - received post_data: '{0}'".format(post_data))
+        #self.log_message("omhttp - received post_data: '{0}'".format(post_data))
         if self.path not in data:
             data[self.path] = []
         data[self.path].append(post_data.decode('utf-8'))
@@ -92,6 +96,15 @@ class MyHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
+        # print out contents of data_compress
+        if Debug:
+            self.log_message("do get called, printing out data_decompress...")
+            for elm in data_compress[self.path]:
+                raw_data = zlib.decompress(elm, 31)
+                #data = raw_data.decode('utf-8')
+                self.log_message(raw_data.decode('utf-8'))
+            self.log_message("done.")
+
         if self.path in data:
             result = data[self.path]
         else:
