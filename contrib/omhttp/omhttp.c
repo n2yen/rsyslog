@@ -856,7 +856,7 @@ CODESTARTtryResume
 	DBGPRINTF("omhttp: tryResume called\n");
 	iRet = checkConn(pWrkrData);
 	if (iRet == RS_RET_OK) {
-		fprintf(stderr, "tryResume - suspend has been reset.\n");
+		DBGPRINTF("tryResume - suspend has been reset.\n");
 		pWrkrData->bIsSuspended = 0;
 	}
 ENDtryResume
@@ -1107,13 +1107,13 @@ queueBatchOnRetryRuleset(const omhttpBatch_t *batch, instanceData *const pData)
 	DEFiRet;
 
 	if (pData->retryRuleset == NULL) {
-		LogError(0, RS_RET_ERR, "omhttp: _queueBatchOnRetryRuleset invalid call with a NULL retryRuleset");
+		LogError(0, RS_RET_ERR, "omhttp: queueBatchOnRetryRuleset invalid call with a NULL retryRuleset");
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
 	for (size_t i = 0; i < batch->nmemb; i++) {
 		msgData = batch->data[i];
-		DBGPRINTF("omhttp: _queueBatchOnRetryRuleset putting message '%s' into retry ruleset '%s'\n",
+		DBGPRINTF("omhttp: queueBatchOnRetryRuleset putting message '%s' into retry ruleset '%s'\n",
 			msgData, pData->retryRulesetName);
 
 		// Construct the message object
@@ -1228,7 +1228,6 @@ finalize_it:
 	RETiRet;
 }
 
-#if 1
 static rsRetVal
 _compressHttpPayload(z_stream* zstrm, int compressionLevel,
 		omhttpCompressCtx_t *compressCtx, uchar *message, unsigned len)
@@ -1291,7 +1290,7 @@ finalize_it:
 	bzInitDone = 0;
 	RETiRet;
 }
-#endif
+
 /* Compress a buffer before sending using zlib. Based on code from tools/omfwd.c
  * Initialize the zstrm object for gzip compression, using this init function.
  * deflateInit2(z_stream strm, int level, int method,
@@ -1996,14 +1995,18 @@ omhttpBatchInitialize(omhttpBatch_t *batch)
 static void ATTR_NONNULL()
 initializeBatch(wrkrInstanceData_t *pWrkrData)
 {
-	pthread_rwlock_wrlock(&pWrkrData->rwlock);
+	if (pWrkrData->rwlockInitialized) {
+		pthread_rwlock_wrlock(&pWrkrData->rwlock);
+	}
 	pWrkrData->batch.sizeBytes = 0;
 	pWrkrData->batch.nmemb = 0;
 	if (pWrkrData->batch.restPath != NULL)  {
 		free(pWrkrData->batch.restPath);
 		pWrkrData->batch.restPath = NULL;
 	}
-	pthread_rwlock_unlock(&pWrkrData->rwlock);
+	if (pWrkrData->rwlockInitialized) {
+		pthread_rwlock_unlock(&pWrkrData->rwlock);
+	}
 }
 
 /* Adds a message to this worker's batch

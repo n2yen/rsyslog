@@ -1,12 +1,13 @@
 #ifndef OMHTTP_SENDER_H_INCLUDED
 #define OMHTTP_SENDER_H_INCLUDED
 
-#include "rsyslog.h"
 #include <errno.h>
 #include <sys/queue.h>
 #include <zlib.h>
 #include <curl/curl.h>
 #include <apr_queue.h>
+#include "config.h"
+#include "rsyslog.h"
 
 typedef struct omhttpBatch_s omhttpBatch_t;
 typedef struct omhttpCompressCtx_s omhttpCompressCtx_t;
@@ -19,9 +20,9 @@ struct omhttpBatch_s {
 };
 
 struct omhttpCompressCtx_s {
-		uchar *buf;
-		size_t curLen;
-		size_t len;
+	uchar *buf;
+	size_t curLen;
+	size_t len;
 };
 
 typedef struct omhttpRequestData_s {
