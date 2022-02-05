@@ -113,6 +113,7 @@ typedef struct instanceConf_s {
 	uchar **serverBaseUrls;
 	int numServers;
 	long healthCheckTimeout;
+	long restPathTimeout;
 	uchar *uid;
 	uchar *pwd;
 	uchar *authBuf;
@@ -197,6 +198,7 @@ static struct cnfparamdescr actpdescr[] = {
 	{ "server", eCmdHdlrArray, 0 },
 	{ "serverport", eCmdHdlrInt, 0 },
 	{ "healthchecktimeout", eCmdHdlrInt, 0 },
+	{ "restpathtimeout", eCmdHdlrInt, 0 },
 	{ "httpcontenttype", eCmdHdlrGetWord, 0 },
 	{ "httpheaderkey", eCmdHdlrGetWord, 0 },
 	{ "httpheadervalue", eCmdHdlrString, 0 },
@@ -398,9 +400,8 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 	int compressionLevel = pWrkrData->pData->compressionLevel;
 	curl_easy_setopt(curl, CURLOPT_URL, pRequestData->restUrl);
 
-	uchar *message = pRequestData->postData;
+	uchar *postData = pRequestData->postData;
 	int msglen = pRequestData->postLen;
-	uchar *postData = message;
 	int postLen = msglen;
 
 	if (pWrkrData->pData->compress) {
@@ -444,24 +445,21 @@ omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode curlResult, void *privateDat
 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*)privateData;
 	DEFiRet;
 
-	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
-	assert(code == CURLE_OK);
-	assert(pRequestData!=NULL);
-	code = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
-	pRequestData->statusCode = statusCode;
-	if (!pRequestData) {
-		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
-	}
-
 	if (curlResult != CURLE_OK) {
 		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
+	} else {
+		STATSCOUNTER_INC(ctrHttpRequestSuccess, mutCtrHttpRequestSuccess);
+	}
 
-		code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
-		if (code != CURLE_OK) {
-			// TODO: report an error
-			FINALIZE;
-		}
+	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
+	if (code != CURLE_OK || !pRequestData) {
+		FINALIZE;
+	}
 
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
+	pRequestData->statusCode = statusCode;
+
+	if (curlResult != CURLE_OK) {
 		LogError(0, RS_RET_SUSPENDED,
 			"omhttp: 'senderCurlCompleteCb' suspending ourselves due to server failure %lld: %s",
 			(long long) curlResult, pRequestData->errbuf);
@@ -470,8 +468,6 @@ omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode curlResult, void *privateDat
 		// idea to keep hitting a dead server. The http status code will be 0 at this point.
 		CHKiRet(checkResultWithLock(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
 					curlResult, pRequestData->reply, pRequestData->replyLen, pRequestData->postData));
-	} else {
-		STATSCOUNTER_INC(ctrHttpRequestSuccess, mutCtrHttpRequestSuccess);
 	}
 
 	CHKiRet(omhttpSenderCheckResult(pWrkrData, pRequestData, curlResult));
@@ -624,6 +620,7 @@ CODESTARTdbgPrintInstInfo
 	dbgprintf("\ttemplate='%s'\n", pData->tplName);
 	dbgprintf("\tnumServers=%d\n", pData->numServers);
 	dbgprintf("\thealthCheckTimeout=%lu\n", pData->healthCheckTimeout);
+	dbgprintf("\trestPathTimeout=%lu\n", pData->restPathTimeout);
 	dbgprintf("\tserverBaseUrls=");
 	for(i = 0 ; i < pData->numServers ; ++i)
 		dbgprintf("%c'%s'", i == 0 ? '[' : ' ', pData->serverBaseUrls[i]);
@@ -856,7 +853,7 @@ CODESTARTtryResume
 	DBGPRINTF("omhttp: tryResume called\n");
 	iRet = checkConn(pWrkrData);
 	if (iRet == RS_RET_OK) {
-		fprintf(stderr, "tryResume - suspend has been reset.\n");
+		DBGPRINTF("tryResume - suspend has been reset.\n");
 		pWrkrData->bIsSuspended = 0;
 	}
 ENDtryResume
@@ -1107,13 +1104,13 @@ queueBatchOnRetryRuleset(const omhttpBatch_t *batch, instanceData *const pData)
 	DEFiRet;
 
 	if (pData->retryRuleset == NULL) {
-		LogError(0, RS_RET_ERR, "omhttp: _queueBatchOnRetryRuleset invalid call with a NULL retryRuleset");
+		LogError(0, RS_RET_ERR, "omhttp: queueBatchOnRetryRuleset invalid call with a NULL retryRuleset");
 		ABORT_FINALIZE(RS_RET_ERR);
 	}
 
 	for (size_t i = 0; i < batch->nmemb; i++) {
 		msgData = batch->data[i];
-		DBGPRINTF("omhttp: _queueBatchOnRetryRuleset putting message '%s' into retry ruleset '%s'\n",
+		DBGPRINTF("omhttp: queueBatchOnRetryRuleset putting message '%s' into retry ruleset '%s'\n",
 			msgData, pData->retryRulesetName);
 
 		// Construct the message object
@@ -1228,7 +1225,6 @@ finalize_it:
 	RETiRet;
 }
 
-#if 1
 static rsRetVal
 _compressHttpPayload(z_stream* zstrm, int compressionLevel,
 		omhttpCompressCtx_t *compressCtx, uchar *message, unsigned len)
@@ -1291,7 +1287,7 @@ finalize_it:
 	bzInitDone = 0;
 	RETiRet;
 }
-#endif
+
 /* Compress a buffer before sending using zlib. Based on code from tools/omfwd.c
  * Initialize the zstrm object for gzip compression, using this init function.
  * deflateInit2(z_stream strm, int level, int method,
@@ -1609,7 +1605,6 @@ omhttpSenderCurlPost(const wrkrInstanceData_t *pWrkrData, uchar *message, int ms
 	omhttpRequestData_t *pRequestData = (omhttpRequestData_t*) calloc(1, sizeof(omhttpRequestData_t));
 	omhttpBatchInitialize(&pRequestData->batchData);
 
-	// set post url, but use
 	CHKiRet(setPostURLExternal(pWrkrData, tpls, &pRequestData->restUrl));
 
 	postData = (char*)message;
@@ -1996,14 +1991,18 @@ omhttpBatchInitialize(omhttpBatch_t *batch)
 static void ATTR_NONNULL()
 initializeBatch(wrkrInstanceData_t *pWrkrData)
 {
-	pthread_rwlock_wrlock(&pWrkrData->rwlock);
+	if (pWrkrData->rwlockInitialized) {
+		pthread_rwlock_wrlock(&pWrkrData->rwlock);
+	}
 	pWrkrData->batch.sizeBytes = 0;
 	pWrkrData->batch.nmemb = 0;
 	if (pWrkrData->batch.restPath != NULL)  {
 		free(pWrkrData->batch.restPath);
 		pWrkrData->batch.restPath = NULL;
 	}
-	pthread_rwlock_unlock(&pWrkrData->rwlock);
+	if (pWrkrData->rwlockInitialized) {
+		pthread_rwlock_unlock(&pWrkrData->rwlock);
+	}
 }
 
 /* Adds a message to this worker's batch
@@ -2231,6 +2230,7 @@ _curlSetupCommon(const wrkrInstanceData_t *const pWrkrData, CURL *const handle)
 	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
 	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
 	curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
+	curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, pWrkrData->pData->restPathTimeout);
 	if(pWrkrData->pData->allowUnsignedCerts)
 		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
 	if(pWrkrData->pData->skipVerifyHost)
@@ -2357,6 +2357,7 @@ setInstParamDefaults(instanceData *const pData)
 	pData->serverBaseUrls = NULL;
 	pData->defaultPort = 443;
 	pData->healthCheckTimeout = 3500;
+	pData->restPathTimeout = 3500;
 	pData->uid = NULL;
 	pData->httpcontenttype = NULL;
 	pData->headerContentTypeBuf = NULL;
@@ -2437,6 +2438,8 @@ CODESTARTnewActInst
 			pData->defaultPort = (int) pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "healthchecktimeout")) {
 			pData->healthCheckTimeout = (long) pvals[i].val.d.n;
+		} else if(!strcmp(actpblk.descr[i].name, "restpathtimeout")) {
+			pData->restPathTimeout = (long) pvals[i].val.d.n;
 		} else if(!strcmp(actpblk.descr[i].name, "uid")) {
 			pData->uid = (uchar*)es_str2cstr(pvals[i].val.d.estr, NULL);
 		} else if(!strcmp(actpblk.descr[i].name, "httpcontenttype")) {
