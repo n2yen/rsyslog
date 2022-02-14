@@ -885,6 +885,11 @@ TESTS +=  \
 	omhttp-multiplehttpheaders.sh \
 	omhttp-dynrestpath.sh \
 	omhttp-batch-dynrestpath.sh
+	omhttp-sender-batch-jsonarray-compress.sh \
+	omhttp-sender-batch-jsonarray-retry.sh \
+	omhttp-sender-batch-jsonarray.sh \
+	omhttp-sender-batch-kafkarest-retry.sh \
+	omhttp-sender-batch-kafkarest.sh
 if HAVE_VALGRIND
 TESTS +=  \
 	omhttp-auth-vg.sh \
@@ -895,6 +900,10 @@ TESTS +=  \
 	omhttp-batch-kafkarest-retry-vg.sh \
 	omhttp-batch-lokirest-retry-vg.sh \
 	omhttp-retry-vg.sh
+	omhttp-sender-batch-jsonarray-compress-vg.sh \
+	omhttp-sender-batch-jsonarray-retry-vg.sh \
+	omhttp-sender-batch-jsonarray-vg.sh \
+	omhttp-sender-batch-kafkarest-retry-vg.sh
 endif
 endif
 

@@ -7,8 +7,6 @@
 export NUMMESSAGES=50000
 
 port="$(get_free_port)"
-#omhttp_start_server $port --fail-every 100
-#omhttp_start_server $port --fail-every 100 --delay-response-at 100 --delay-secs 5
 omhttp_start_server $port --fail-every 100 --fail-with-delay-secs 3
 
 generate_conf
