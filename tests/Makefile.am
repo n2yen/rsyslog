@@ -881,12 +881,14 @@ TESTS +=  \
 	omhttp-batch-lokirest.sh \
 	omhttp-batch-newline.sh \
 	omhttp-retry.sh \
+	omhttp-retry-timeout.sh \
 	omhttp-httpheaderkey.sh \
 	omhttp-multiplehttpheaders.sh \
 	omhttp-dynrestpath.sh \
-	omhttp-batch-dynrestpath.sh
+	omhttp-batch-dynrestpath.sh \
 	omhttp-sender-batch-jsonarray-compress.sh \
 	omhttp-sender-batch-jsonarray-retry.sh \
+	omhttp-sender-batch-jsonarray-retry-timeout.sh \
 	omhttp-sender-batch-jsonarray.sh \
 	omhttp-sender-batch-kafkarest-retry.sh \
 	omhttp-sender-batch-kafkarest.sh
@@ -899,9 +901,11 @@ TESTS +=  \
 	omhttp-batch-jsonarray-vg.sh \
 	omhttp-batch-kafkarest-retry-vg.sh \
 	omhttp-batch-lokirest-retry-vg.sh \
-	omhttp-retry-vg.sh
+	omhttp-retry-vg.sh \
+	omhttp-retry-timeout-vg.sh \
 	omhttp-sender-batch-jsonarray-compress-vg.sh \
 	omhttp-sender-batch-jsonarray-retry-vg.sh \
+	omhttp-sender-batch-jsonarray-retry-timeout-vg.sh \
 	omhttp-sender-batch-jsonarray-vg.sh \
 	omhttp-sender-batch-kafkarest-retry-vg.sh
 endif

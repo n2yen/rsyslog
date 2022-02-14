@@ -78,6 +78,36 @@ finalize_it:
 	RETiRet;
 }
 
+static void completeCurlRequests(sender_t *me)
+{
+	CURLMcode mcode;
+	int msgs_left = 0;
+	CURLMsg *msg = NULL;
+	CURL *curl = NULL;
+	while ((msg = curl_multi_info_read(me->curlm, &msgs_left))) {
+		CURLcode curlResult = 0;
+		if (msg->msg == CURLMSG_DONE) {
+			curl = msg->easy_handle;
+			curlResult = msg->data.result;
+			if (curlResult != CURLE_OK) {
+				fprintf(stderr, "omhttp_sender: %s() - curl handle: %p, error code: %d:%s\n",
+						__FUNCTION__, (void *)curl, curlResult,
+						curl_multi_strerror(curlResult));
+			}
+			me->curlPostComplete(curl, curlResult, me->privateData);
+			mcode = curl_multi_remove_handle(me->curlm, curl);
+			if (mcode == CURLM_OK) {
+				me->curlHandlesCount--;
+				me->processedRequests++;
+				curl_easy_reset(curl);
+			} else {
+				fprintf(stderr, "omhttp_sender: error curl_multi_remove_handle ret- %d:%s\n",
+								 mcode, curl_multi_strerror(mcode));
+			}
+		}
+	}
+}
+
 #define WAITMS(x) \
     struct timeval wait = { 0, (x)*1000 }; \
     (void)select(0, NULL, NULL, NULL, &wait);
@@ -91,16 +121,15 @@ static __attribute__((noreturn)) void *senderTask(void *data)
 	fprintf(stderr, "omhttp_sender: thread (%p) started.\n", (const void*)me->tid);
 	assert(me->tid == pthread_self());
 	int repeats = 0;
-	size_t num_easy = 0;
 	CURLMcode mcode;
 	while (1)
 	{
-		while (apr_queue_size(me->request_q) && num_easy < me->curlHandlesCapacity) {
+		while (apr_queue_size(me->request_q) && me->curlHandlesCount < me->curlHandlesCapacity) {
 			omhttpRequestData_t *pRequestData = NULL;
 
 			dequeueSendReq(me, &pRequestData, 0);
 			if (pRequestData) {
-				CURL *curl = me->curlHandles[num_easy];
+				CURL *curl = me->curlHandles[me->curlHandlesCount];
 				curl_easy_reset(curl);
 				assert(curl != NULL);
 				if (me->curlPostSetup) {
@@ -111,11 +140,10 @@ static __attribute__((noreturn)) void *senderTask(void *data)
 				}
 				mcode = curl_multi_add_handle(me->curlm, curl);
 				if (mcode == CURLM_OK) {
-					num_easy++;
+					me->curlHandlesCount++;
 				} else {
-					LogError(0, RS_RET_ERR,
-									 "omhttp_sender: error curl_multi_add_handle ret- %d:%s\n",
-									 mcode, curl_multi_strerror(mcode));
+					fprintf(stderr, "omhttp_sender: error curl_multi_add_handle ret- %d:%s\n",
+							mcode, curl_multi_strerror(mcode));
 					assert(0);
 				}
 			} else {
@@ -148,36 +176,10 @@ static __attribute__((noreturn)) void *senderTask(void *data)
 			}
 		} while (still_running);
 
-		int msgs_left = 0;
-		CURLMsg *msg = NULL;
-		CURL *curl = NULL;
-		while ((msg = curl_multi_info_read(me->curlm, &msgs_left))) {
-			CURLcode curlResult = 0;
-			if (msg->msg == CURLMSG_DONE) {
-				curl = msg->easy_handle;
-				curlResult = msg->data.result;
-				if (curlResult != CURLE_OK) {
-					LogError(0, RS_RET_ERR,
-							"omhttp_sender: %s() - curl handle: %p, error code: %d:%s\n",
-							__FUNCTION__, (void *)curl, curlResult,
-							curl_multi_strerror(curlResult));
-				}
-				me->curlPostComplete(curl, curlResult, me->privateData);
-				mcode = curl_multi_remove_handle(me->curlm, curl);
-				if (mcode == CURLM_OK) {
-					num_easy--;
-					me->processedRequests++;
-					curl_easy_reset(curl);
-				} else {
-					LogError(0, RS_RET_ERR,
-									 "omhttp_sender: error curl_multi_remove_handle ret- %d:%s\n",
-									 mcode, curl_multi_strerror(mcode));
-					assert(0);
-				}
-			}
-		}
+		completeCurlRequests(me);
 
 		if (shutdownWorker(me)) {
+			completeCurlRequests(me);
 			break;
 		}
 	}

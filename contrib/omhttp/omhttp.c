@@ -270,7 +270,7 @@ _compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
 		omhttpCompressCtx_t *compressCtx, uchar *message, unsigned len);
 
 static rsRetVal ATTR_NONNULL()
-_buildCurlHeaders(const wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip,
+_buildCurlHeaders(wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip,
 		struct curl_slist **out_curlHeader);
 
 static rsRetVal
@@ -356,7 +356,7 @@ finalize_it:
 }
 
 static CURLcode ATTR_NONNULL()
-omhttpSenderCurlSetup(const wrkrInstanceData_t *const pWrkrData, omhttpRequestData_t *pRequestData, CURL *const curlPostHandle)
+omhttpSenderCurlSetup(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pRequestData, CURL *const curlPostHandle)
 {
 	CURLcode code;
 	code = _curlPostSetup(pWrkrData, curlPostHandle);
@@ -385,9 +385,10 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 	int compressed = 0;
 	DEFiRet;
 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*)privateData;
-	pthread_rwlock_rdlock(&pWrkrData->rwlock);
 
+	pthread_rwlock_rdlock(&pWrkrData->rwlock);
 	int compressionLevel = pWrkrData->pData->compressionLevel;
+	pthread_rwlock_unlock(&pWrkrData->rwlock);
 	curl_easy_setopt(curl, CURLOPT_URL, pRequestData->restUrl);
 
 	uchar *postData = pRequestData->postData;
@@ -419,7 +420,6 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, pRequestData->errbuf);
 
 finalize_it:
-	pthread_rwlock_unlock(&pWrkrData->rwlock);
 	if (iRet != RS_RET_OK) {
 		;
 	}
@@ -1363,12 +1363,13 @@ finalize_it:
  * Additionally, the curlCheckConnHandle should not be configured with a gzip header.
  */
 static rsRetVal ATTR_NONNULL()
-_buildCurlHeaders(const wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip, struct curl_slist **out_curlHeader)
+_buildCurlHeaders(wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip, struct curl_slist **out_curlHeader)
 {
 	struct curl_slist *slist = NULL;
 
 	DEFiRet;
 
+	pthread_rwlock_rdlock(&pWrkrData->rwlock);
 	if (pWrkrData->pData->httpcontenttype != NULL) {
 		// If content type specified use it, otherwise use a sane default
 		slist = curl_slist_append(slist, (char *)pWrkrData->pData->headerContentTypeBuf);
@@ -1423,6 +1424,7 @@ _buildCurlHeaders(const wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip, 
 	*out_curlHeader = slist;
 
 finalize_it:
+	pthread_rwlock_unlock(&pWrkrData->rwlock);
 	RETiRet;
 }
 
@@ -2109,7 +2111,7 @@ _curlSetupCommon(const wrkrInstanceData_t *const pWrkrData, CURL *const handle)
 }
 
 static void ATTR_NONNULL()
-curlSetupCommon(wrkrInstanceData_t *const pWrkrData, CURL *const handle)
+curlSetupCommon(wrkrInstanceData_t *pWrkrData, CURL *const handle)
 {
 	PTR_ASSERT_SET_TYPE(pWrkrData, WRKR_DATA_TYPE_ES);
 	_curlSetupCommon(pWrkrData, handle);
@@ -2196,6 +2198,7 @@ finalize_it:
 static void ATTR_NONNULL()
 curlCleanup(wrkrInstanceData_t *const pWrkrData)
 {
+	pthread_rwlock_wrlock(&pWrkrData->rwlock);
 	if (pWrkrData->curlHeader != NULL) {
 		curl_slist_free_all(pWrkrData->curlHeader);
 		pWrkrData->curlHeader = NULL;
@@ -2208,6 +2211,7 @@ curlCleanup(wrkrInstanceData_t *const pWrkrData)
 		curl_easy_cleanup(pWrkrData->curlPostHandle);
 		pWrkrData->curlPostHandle = NULL;
 	}
+	pthread_rwlock_unlock(&pWrkrData->rwlock);
 }
 
 static void ATTR_NONNULL()

@@ -4,10 +4,10 @@
 #  Starting actual testbench
 . ${srcdir:=.}/diag.sh init
 
-export NUMMESSAGES=100
+export NUMMESSAGES=10000
 
 port="$(get_free_port)"
-omhttp_start_server $port --fail-every 50 --fail-with-delay-secs 10
+omhttp_start_server $port --fail-every 1000 --fail-with-delay-secs 3
 
 generate_conf
 add_conf '
@@ -23,6 +23,7 @@ if $msg contains "msgnum:" then
 		# Payload
 		action.resumeRetryCount="-1"
 		action.resumeInterval="1"
+		action.resumeIntervalMax="1"
 		name="my_http_action"
 		type="omhttp"
 		errorfile="'$RSYSLOG_DYNNAME/omhttp.error.log'"
@@ -31,7 +32,7 @@ if $msg contains "msgnum:" then
 		server="localhost"
 		serverport="'$port'"
 		restpath="my/endpoint"
-		restpathtimeout="1000"
+    restpathtimeout="1000"
 		checkpath="ping"
 		batch="off"
 
