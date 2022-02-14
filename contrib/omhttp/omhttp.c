@@ -247,13 +247,13 @@ static void ATTR_NONNULL()
 freeCompressCtx(wrkrInstanceData_t *pWrkrData);
 
 static rsRetVal ATTR_NONNULL()
-resetCompressCtx(wrkrInstanceData_t *pWrkrData, size_t len);
+resetCompressCtx(omhttpCompressCtx_t *compressCtx, size_t len);
 
 static rsRetVal ATTR_NONNULL()
-growCompressCtx(wrkrInstanceData_t *pWrkrData, size_t newLen);
+growCompressCtx(omhttpCompressCtx_t *compressCtx, size_t newLen);
 
 static rsRetVal ATTR_NONNULL()
-appendCompressCtx(wrkrInstanceData_t *pWrkrData, uchar *srcBuf, size_t srcLen);
+appendCompressCtx(omhttpCompressCtx_t *compressCtx, uchar *srcBuf, size_t srcLen);
 
 static rsRetVal ATTR_NONNULL()
 buildCurlHeaders(wrkrInstanceData_t *pWrkrData, sbool contentEncodeGzip);
@@ -264,15 +264,6 @@ omhttpBatchInitialize(omhttpBatch_t *batch);
 
 static CURLcode ATTR_NONNULL(1)
 _curlPostSetup(const wrkrInstanceData_t *const pWrkrData, CURL *curlHandle);
-
-static rsRetVal ATTR_NONNULL()
-_resetCompressCtx(omhttpCompressCtx_t *compressCtx, size_t len);
-
-static rsRetVal ATTR_NONNULL()
-_growCompressCtx(omhttpCompressCtx_t *compressCtx, size_t newLen);
-
-static rsRetVal ATTR_NONNULL()
-_appendCompressCtx(omhttpCompressCtx_t *compressCtx, uchar *srcBuf, size_t srcLen);
 
 static rsRetVal
 _compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
@@ -1197,6 +1188,18 @@ finalize_it:
 	RETiRet;
 }
 
+/* Compress a buffer before sending using zlib. Based on code from tools/omfwd.c
+ * Initialize the zstrm object for gzip compression, using this init function.
+ * deflateInit2(z_stream strm, int level, int method,
+ *                             int windowBits, int memLevel, int strategy);
+ * strm: the zlib stream held in pWrkrData
+ * level: the compression level held in pData
+ * method: the operation constant Z_DEFLATED
+ * windowBits: the size of the compression window 15 = log_2(32768)
+ *     to configure as gzip add 16 to windowBits (w | 16) for final value 31
+ * memLevel: the memory optimization level 8 is default)
+ * strategy: using Z_DEFAULT_STRATEGY is default
+ */
 static rsRetVal
 _compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
 		omhttpCompressCtx_t *compressCtx, uchar *message, unsigned len)
@@ -1224,7 +1227,7 @@ _compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
 		bzInitDone = 1;
 	}
 
-	CHKiRet(_resetCompressCtx(compressCtx, len));
+	CHKiRet(resetCompressCtx(compressCtx, len));
 
 	/* now doing the compression */
 	zstrm->next_in = (Bytef*) message;
@@ -1243,7 +1246,7 @@ _compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
 			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
 		outavail = sizeof(zipBuf) - zstrm->avail_out;
 		if (outavail != 0)
-			CHKiRet(_appendCompressCtx(compressCtx, zipBuf, outavail));
+			CHKiRet(appendCompressCtx(compressCtx, zipBuf, outavail));
 
 	} while (zstrm->avail_out == 0);
 
@@ -1255,7 +1258,7 @@ _compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
 		deflate(zstrm, Z_FINISH); /* returns Z_STREAM_END == 1 */
 		outavail = sizeof(zipBuf) - zstrm->avail_out;
 		if (outavail != 0)
-			CHKiRet(_appendCompressCtx(compressCtx, zipBuf, outavail));
+			CHKiRet(appendCompressCtx(compressCtx, zipBuf, outavail));
 
 	} while (zstrm->avail_out == 0);
 
@@ -1269,85 +1272,11 @@ finalize_it:
 	RETiRet;
 }
 
-/* Compress a buffer before sending using zlib. Based on code from tools/omfwd.c
- * Initialize the zstrm object for gzip compression, using this init function.
- * deflateInit2(z_stream strm, int level, int method,
- *                             int windowBits, int memLevel, int strategy);
- * strm: the zlib stream held in pWrkrData
- * level: the compression level held in pData
- * method: the operation constant Z_DEFLATED
- * windowBits: the size of the compression window 15 = log_2(32768)
- *     to configure as gzip add 16 to windowBits (w | 16) for final value 31
- * memLevel: the memory optimization level 8 is default)
- * strategy: using Z_DEFAULT_STRATEGY is default
- */
 static rsRetVal
 compressHttpPayload(wrkrInstanceData_t *pWrkrData, uchar *message, unsigned len)
 {
-#if 1
 	return _compressHttpPayload(&pWrkrData->bzInitDone, &pWrkrData->zstrm,
 			pWrkrData->pData->compressionLevel, &pWrkrData->compressCtx, message, len);
-#else
-	int zRet;
-	unsigned outavail;
-	uchar zipBuf[32*1024];
-
-	DEFiRet;
-
-	if (!pWrkrData->bzInitDone) {
-		pWrkrData->zstrm.zalloc = Z_NULL;
-		pWrkrData->zstrm.zfree = Z_NULL;
-		pWrkrData->zstrm.opaque = Z_NULL;
-		zRet = deflateInit2(&pWrkrData->zstrm, pWrkrData->pData->compressionLevel,
-			Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY);
-		if (zRet != Z_OK) {
-			DBGPRINTF("omhttp: compressHttpPayload error %d returned from zlib/deflateInit2()\n", zRet);
-			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
-		}
-		pWrkrData->bzInitDone = 1;
-	}
-
-	CHKiRet(resetCompressCtx(pWrkrData, len));
-
-	/* now doing the compression */
-	pWrkrData->zstrm.next_in = (Bytef*) message;
-	pWrkrData->zstrm.avail_in = len;
-	/* run deflate() on buffer until everything has been compressed */
-	do {
-		DBGPRINTF("omhttp: compressHttpPayload in deflate() loop, avail_in %d, total_in %ld\n",
-				pWrkrData->zstrm.avail_in, pWrkrData->zstrm.total_in);
-		pWrkrData->zstrm.avail_out = sizeof(zipBuf);
-		pWrkrData->zstrm.next_out = zipBuf;
-
-		zRet = deflate(&pWrkrData->zstrm, Z_NO_FLUSH);
-		DBGPRINTF("omhttp: compressHttpPayload after deflate, ret %d, avail_out %d\n",
-				zRet, pWrkrData->zstrm.avail_out);
-		if (zRet != Z_OK)
-			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
-		outavail = sizeof(zipBuf) - pWrkrData->zstrm.avail_out;
-		if (outavail != 0)
-			CHKiRet(appendCompressCtx(pWrkrData, zipBuf, outavail));
-
-	} while (pWrkrData->zstrm.avail_out == 0);
-
-	/* run deflate again with Z_FINISH with no new input */
-	pWrkrData->zstrm.avail_in = 0;
-	do {
-		pWrkrData->zstrm.avail_out = sizeof(zipBuf);
-		pWrkrData->zstrm.next_out = zipBuf;
-		deflate(&pWrkrData->zstrm, Z_FINISH); /* returns Z_STREAM_END == 1 */
-		outavail = sizeof(zipBuf) - pWrkrData->zstrm.avail_out;
-		if (outavail != 0)
-			CHKiRet(appendCompressCtx(pWrkrData, zipBuf, outavail));
-
-	} while (pWrkrData->zstrm.avail_out == 0);
-
-finalize_it:
-	if (pWrkrData->bzInitDone)
-		deflateEnd(&pWrkrData->zstrm);
-	pWrkrData->bzInitDone = 0;
-	RETiRet;
-#endif
 }
 
 void ATTR_NONNULL()
@@ -1378,19 +1307,16 @@ _freeCompressCtx(omhttpCompressCtx_t *compressCtx)
 static void ATTR_NONNULL()
 freeCompressCtx(wrkrInstanceData_t *pWrkrData)
 {
-	if (pWrkrData->compressCtx.buf != NULL) {
-		free(pWrkrData->compressCtx.buf);
-		pWrkrData->compressCtx.buf = NULL;
-	}
+	return _freeCompressCtx(&pWrkrData->compressCtx);
 }
 
 static rsRetVal ATTR_NONNULL()
-_resetCompressCtx(omhttpCompressCtx_t *compressCtx, size_t len)
+resetCompressCtx(omhttpCompressCtx_t *compressCtx, size_t len)
 {
 	DEFiRet;
 	compressCtx->curLen = 0;
 	compressCtx->len = len;
-	CHKiRet(_growCompressCtx(compressCtx, len));
+	CHKiRet(growCompressCtx(compressCtx, len));
 finalize_it:
 	if (iRet != RS_RET_OK) {
 		_freeCompressCtx(compressCtx);
@@ -1399,21 +1325,7 @@ finalize_it:
 }
 
 static rsRetVal ATTR_NONNULL()
-resetCompressCtx(wrkrInstanceData_t *pWrkrData, size_t len)
-{
-	DEFiRet;
-	pWrkrData->compressCtx.curLen = 0;
-	pWrkrData->compressCtx.len = len;
-	CHKiRet(growCompressCtx(pWrkrData, len));
-
-finalize_it:
-	if (iRet != RS_RET_OK)
-		freeCompressCtx(pWrkrData);
-	RETiRet;
-}
-
-static rsRetVal ATTR_NONNULL()
-_growCompressCtx(omhttpCompressCtx_t *compressCtx, size_t newLen)
+growCompressCtx(omhttpCompressCtx_t *compressCtx, size_t newLen)
 {
 	DEFiRet;
 	if (compressCtx->buf == NULL) {
@@ -1429,30 +1341,13 @@ finalize_it:
 }
 
 static rsRetVal ATTR_NONNULL()
-growCompressCtx(wrkrInstanceData_t *pWrkrData, size_t newLen)
-{
-	DEFiRet;
-	if (pWrkrData->compressCtx.buf == NULL) {
-		CHKmalloc(pWrkrData->compressCtx.buf = (uchar *)malloc(sizeof(uchar)*newLen));
-	} else {
-		uchar *const newbuf = (uchar *)realloc(pWrkrData->compressCtx.buf, sizeof(uchar)*newLen);
-		CHKmalloc(newbuf);
-		pWrkrData->compressCtx.buf = newbuf;
-	}
-	pWrkrData->compressCtx.len = newLen;
-finalize_it:
-	RETiRet;
-
-}
-
-static rsRetVal ATTR_NONNULL()
-_appendCompressCtx(omhttpCompressCtx_t *compressCtx, uchar *srcBuf, size_t srcLen)
+appendCompressCtx(omhttpCompressCtx_t *compressCtx, uchar *srcBuf, size_t srcLen)
 {
 	size_t newLen;
 	DEFiRet;
 	newLen = compressCtx->curLen + srcLen;
 	if (newLen > compressCtx->len)
-		CHKiRet(_growCompressCtx(compressCtx, newLen));
+		CHKiRet(growCompressCtx(compressCtx, newLen));
 
 	memcpy(compressCtx->buf + compressCtx->curLen,
 		srcBuf, srcLen);
@@ -1460,24 +1355,6 @@ _appendCompressCtx(omhttpCompressCtx_t *compressCtx, uchar *srcBuf, size_t srcLe
 finalize_it:
 	if (iRet != RS_RET_OK)
 		_freeCompressCtx(compressCtx);
-	RETiRet;
-}
-
-static rsRetVal ATTR_NONNULL()
-appendCompressCtx(wrkrInstanceData_t *pWrkrData, uchar *srcBuf, size_t srcLen)
-{
-	size_t newLen;
-	DEFiRet;
-	newLen = pWrkrData->compressCtx.curLen + srcLen;
-	if (newLen > pWrkrData->compressCtx.len)
-		CHKiRet(growCompressCtx(pWrkrData, newLen));
-
-	memcpy(pWrkrData->compressCtx.buf + pWrkrData->compressCtx.curLen,
-		srcBuf, srcLen);
-	pWrkrData->compressCtx.curLen = newLen;
-finalize_it:
-	if (iRet != RS_RET_OK)
-		freeCompressCtx(pWrkrData);
 	RETiRet;
 }
 
