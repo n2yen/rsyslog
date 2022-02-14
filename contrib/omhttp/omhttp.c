@@ -189,7 +189,6 @@ typedef struct wrkrInstanceData {
 	// we don't need a mutex, instead use a rwlock
 	sbool rwlockInitialized;
 	pthread_rwlock_t rwlock;
-	sbool bIsSuspended;
 } wrkrInstanceData_t;
 
 /* tables for interfacing with the v6 config system */
@@ -276,7 +275,7 @@ static rsRetVal ATTR_NONNULL()
 _appendCompressCtx(omhttpCompressCtx_t *compressCtx, uchar *srcBuf, size_t srcLen);
 
 static rsRetVal
-_compressHttpPayload(z_stream* zstrm, int compressionLevel,
+_compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
 		omhttpCompressCtx_t *compressCtx, uchar *message, unsigned len);
 
 static rsRetVal ATTR_NONNULL()
@@ -338,7 +337,7 @@ omhttpSenderCheckResult(wrkrInstanceData_t *pWrkrData, omhttpRequestData_t *pReq
 		// Usually in batch mode we clobber any iRet values, but probably not a great
 		// idea to keep hitting a dead server. The http status code will be 0 at this point.
 		checkResultWithLock(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
-				curlCode, pRequestData->reply, pRequestData->replyLen, pRequestData->postData);
+				pRequestData->statusCode, pRequestData->reply, pRequestData->replyLen, pRequestData->postData);
 
 		ABORT_FINALIZE(RS_RET_SUSPENDED);
 	} else {
@@ -405,7 +404,7 @@ omhttpSenderCurlPostSetOptsCb(CURL* curl, omhttpRequestData_t *pRequestData, z_s
 	int postLen = msglen;
 
 	if (pWrkrData->pData->compress) {
-		iRet = _compressHttpPayload(zstrm, compressionLevel, compressCtx, postData, postLen);
+		iRet = _compressHttpPayload(NULL, zstrm, compressionLevel, compressCtx, postData, postLen);
 		if (iRet != RS_RET_OK) {
 			LogError(0, iRet, "omhttp: curlPost error while compressing, will default to uncompressed");
 		} else {
@@ -439,47 +438,24 @@ finalize_it:
 static rsRetVal
 omhttpSenderCurlPostCompleteCb(CURL *curl, CURLcode curlResult, void *privateData)
 {
-	CURLcode code;
-	long statusCode;
+	CURLcode code, statusCode;
 	omhttpRequestData_t *pRequestData = NULL;
 	wrkrInstanceData_t *pWrkrData = (wrkrInstanceData_t*)privateData;
 	DEFiRet;
 
-	if (curlResult != CURLE_OK) {
-		STATSCOUNTER_INC(ctrHttpRequestFail, mutCtrHttpRequestFail);
-	} else {
-		STATSCOUNTER_INC(ctrHttpRequestSuccess, mutCtrHttpRequestSuccess);
-	}
-
 	code = curl_easy_getinfo(curl, CURLINFO_PRIVATE, &pRequestData);
-	if (code != CURLE_OK || !pRequestData) {
+	if (code != CURLE_OK && !pRequestData) {
 		FINALIZE;
 	}
 
 	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
 	pRequestData->statusCode = statusCode;
-
-	if (curlResult != CURLE_OK) {
-		LogError(0, RS_RET_SUSPENDED,
-			"omhttp: 'senderCurlCompleteCb' suspending ourselves due to server failure %lld: %s",
-			(long long) curlResult, pRequestData->errbuf);
-		// Check the result here too and retry if needed, then we should suspend
-		// Usually in batch mode we clobber any iRet values, but probably not a great
-		// idea to keep hitting a dead server. The http status code will be 0 at this point.
-		CHKiRet(checkResultWithLock(pWrkrData, &pRequestData->batchData, pRequestData->restUrl,
-					curlResult, pRequestData->reply, pRequestData->replyLen, pRequestData->postData));
-	}
-
 	CHKiRet(omhttpSenderCheckResult(pWrkrData, pRequestData, curlResult));
 
+finalize_it:
 	curl_slist_free_all(pRequestData->curlHeader);
 	for (size_t i = 0; i < pRequestData->batchData.nmemb; ++i) {
 		free(pRequestData->batchData.data[i]);
-	}
-finalize_it:
-	if (iRet != RS_RET_OK) {
-		pWrkrData->bIsSuspended = 1;
-		fprintf(stderr, "omhttp: suspended - we should suspend.\n");
 	}
 	free(pRequestData->batchData.data);
 	free(pRequestData->postData);
@@ -852,10 +828,6 @@ BEGINtryResume
 CODESTARTtryResume
 	DBGPRINTF("omhttp: tryResume called\n");
 	iRet = checkConn(pWrkrData);
-	if (iRet == RS_RET_OK) {
-		DBGPRINTF("tryResume - suspend has been reset.\n");
-		pWrkrData->bIsSuspended = 0;
-	}
 ENDtryResume
 
 
@@ -1226,7 +1198,7 @@ finalize_it:
 }
 
 static rsRetVal
-_compressHttpPayload(z_stream* zstrm, int compressionLevel,
+_compressHttpPayload(sbool *pBzInitDone, z_stream* zstrm, int compressionLevel,
 		omhttpCompressCtx_t *compressCtx, uchar *message, unsigned len)
 {
 	int zRet;
@@ -1236,15 +1208,21 @@ _compressHttpPayload(z_stream* zstrm, int compressionLevel,
 
 	DEFiRet;
 
-	zstrm->zalloc = Z_NULL;
-	zstrm->zfree = Z_NULL;
-	zstrm->opaque = Z_NULL;
-	zRet = deflateInit2(zstrm, compressionLevel, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY);
-	if (zRet != Z_OK) {
-		DBGPRINTF("omhttp: compressHttpPayload error %d returned from zlib/deflateInit2()\n", zRet);
-		ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+	if (pBzInitDone) {
+		bzInitDone = *pBzInitDone;
 	}
-	bzInitDone = 1;
+
+	if (!bzInitDone) {
+		zstrm->zalloc = Z_NULL;
+		zstrm->zfree = Z_NULL;
+		zstrm->opaque = Z_NULL;
+		zRet = deflateInit2(zstrm, compressionLevel, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY);
+		if (zRet != Z_OK) {
+			DBGPRINTF("omhttp: compressHttpPayload error %d returned from zlib/deflateInit2()\n", zRet);
+			ABORT_FINALIZE(RS_RET_ZLIB_ERR);
+		}
+		bzInitDone = 1;
+	}
 
 	CHKiRet(_resetCompressCtx(compressCtx, len));
 
@@ -1285,6 +1263,9 @@ finalize_it:
 	if (bzInitDone)
 		deflateEnd(zstrm);
 	bzInitDone = 0;
+	if (pBzInitDone) {
+		*pBzInitDone = bzInitDone;
+	}
 	RETiRet;
 }
 
@@ -1303,6 +1284,10 @@ finalize_it:
 static rsRetVal
 compressHttpPayload(wrkrInstanceData_t *pWrkrData, uchar *message, unsigned len)
 {
+#if 1
+	return _compressHttpPayload(&pWrkrData->bzInitDone, &pWrkrData->zstrm,
+			pWrkrData->pData->compressionLevel, &pWrkrData->compressCtx, message, len);
+#else
 	int zRet;
 	unsigned outavail;
 	uchar zipBuf[32*1024];
@@ -1362,7 +1347,7 @@ finalize_it:
 		deflateEnd(&pWrkrData->zstrm);
 	pWrkrData->bzInitDone = 0;
 	RETiRet;
-
+#endif
 }
 
 void ATTR_NONNULL()
@@ -2084,11 +2069,6 @@ sbool submit;
 CODESTARTdoAction
 	instanceData *const pData = pWrkrData->pData;
 	uchar *restPath = NULL;
-
-	if (pWrkrData->bIsSuspended) {
-		DBGPRINTF("omhttp: suspending... \n");
-		ABORT_FINALIZE(RS_RET_SUSPENDED);
-	}
 	STATSCOUNTER_INC(ctrMessagesSubmitted, mutCtrMessagesSubmitted);
 
 	if (pWrkrData->pData->batchMode) {
@@ -2230,7 +2210,9 @@ _curlSetupCommon(const wrkrInstanceData_t *const pWrkrData, CURL *const handle)
 	curl_easy_setopt(handle, CURLOPT_NOSIGNAL, TRUE);
 	curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, curlResult);
 	curl_easy_setopt(handle, CURLOPT_WRITEDATA, pWrkrData);
-	curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, pWrkrData->pData->restPathTimeout);
+	if (pWrkrData->pData->restPathTimeout) {
+		curl_easy_setopt(handle, CURLOPT_TIMEOUT_MS, pWrkrData->pData->restPathTimeout);
+	}
 	if(pWrkrData->pData->allowUnsignedCerts)
 		curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, FALSE);
 	if(pWrkrData->pData->skipVerifyHost)
@@ -2357,7 +2339,7 @@ setInstParamDefaults(instanceData *const pData)
 	pData->serverBaseUrls = NULL;
 	pData->defaultPort = 443;
 	pData->healthCheckTimeout = 3500;
-	pData->restPathTimeout = 3500;
+	pData->restPathTimeout = 0;
 	pData->uid = NULL;
 	pData->httpcontenttype = NULL;
 	pData->headerContentTypeBuf = NULL;
