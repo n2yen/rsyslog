@@ -7,7 +7,7 @@
 export NUMMESSAGES=50000
 
 port="$(get_free_port)"
-omhttp_start_server $port --decompress
+omhttp_start_server $port
 
 generate_conf
 add_conf '
@@ -32,17 +32,17 @@ if $msg contains "msgnum:" then
 		batch="on"
 		batch.format="jsonarray"
 		batch.maxsize="1000"
-		compress="on"
 
-    # senderthread tests
-    senderthread="on"
-    senderthread.maxconnections="2"
+ 		# senderthread tests
+ 		senderthread="on"
+ 		senderthread.maxconnections="2"
 
 		# Auth
 		usehttps="off"
     )
 '
 startup
+sleep 1
 injectmsg
 shutdown_when_empty
 wait_shutdown
